@@ -1,17 +1,17 @@
 # Exchange
 exchange: bybit
 
-# Symbols to scan (added SOL)
+# Symbols (SOL added)
 symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 
-# Timeframes (Bybit-supported)
+# Bybit-supported TFs
 timeframes: ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "12h"]
 
 # Candles & loop
 lookback_bars: 800
 poll_seconds: 20
 
-# Webhook is set on Railway as DISCORD_WEBHOOK_URL (keep blank here)
+# Webhook is set on Railway as DISCORD_WEBHOOK_URL (leave blank here)
 discord_webhook_url: ""
 
 # Impulse detection
@@ -30,7 +30,7 @@ signals:
   confirm_closes: 1
   sfp_window: 3
 
-# Trade plan (for LONG/SHORT alerts)
+# Trade plan (LONG/SHORT alerts)
 risk:
   retest_offset_pct: 0.03
   stop_atr_mult: 1.2
@@ -39,9 +39,9 @@ risk:
 # Deduping
 dedupe_minutes: 30
 
-# Debug / visibility
+# Debug / visibility — now posts to Discord too
 debug:
   log_scans: true
   log_zones: true
   heartbeat_minutes: 1
-  post_debug_to_discord: false   # set to true if you want “Watching…” embeds in Discord
+  post_debug_to_discord: true
