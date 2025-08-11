@@ -37,9 +37,12 @@ def make_payload(symbol, timeframe, cfg, zone, sig, candles):
 
 if __name__ == "__main__":
     cfg = load_cfg()
+    # 🔹 Updated: use DISCORD_WEBHOOK_URL env var if set, fallback to config.yml
+    webhook_url = os.environ.get('DISCORD_WEBHOOK_URL') or cfg.get('discord_webhook_url', '')
+    notify = Notifier(webhook_url)
+
     feed = DataFeed(cfg['exchange'])
     engine = StructureEngine(cfg)
-    notify = Notifier(cfg.get('discord_webhook_url', ''))
     state = State()
 
     while True:
