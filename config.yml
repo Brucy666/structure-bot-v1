@@ -39,7 +39,7 @@ risk:
 # Deduping
 dedupe_minutes: 30
 
-# Debug / visibility — now posts to Discord too
+# Debug / visibility — ON for Discord posting
 debug:
   log_scans: true
   log_zones: true
