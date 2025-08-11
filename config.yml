@@ -1,34 +1,27 @@
-# Exchange to use (must be supported by ccxt)
 exchange: bybit
-
-# Symbols and timeframes to scan
 symbols: ["BTC/USDT", "ETH/USDT"]
-timeframes: ["3m", "12m", "1h"]
 
-# Number of candles to fetch each scan
+# ✅ Use Bybit-supported TFs. Examples below:
+# 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d, 1w
+timeframes: ["3m", "15m", "1h"]
+
 lookback_bars: 600
-
-# Seconds to wait between scans
 poll_seconds: 20
 
-# Discord webhook URL (leave blank here, set in Railway as DISCORD_WEBHOOK_URL)
+# leave blank in repo, set DISCORD_WEBHOOK_URL on Railway
 discord_webhook_url: ""
 
-# Impulse detection settings
 impulse:
-  atr_len: 14          # ATR length
-  body_min: 0.55       # min body / true_range for a candle to count as impulsive
-  atr_mult: 1.2        # min candle true_range vs ATR
-  min_consecutive: 2   # min consecutive impulsive candles
+  atr_len: 14
+  body_min: 0.55
+  atr_mult: 1.2
+  min_consecutive: 2
 
-# Zone settings
 zones:
-  max_zone_pct: 0.35   # cap zone thickness as % of impulse range
+  max_zone_pct: 0.35
 
-# Signal detection settings
 signals:
-  confirm_closes: 1    # closes beyond level to confirm BOS
-  sfp_window: 3        # bars within which close must return inside after wick
+  confirm_closes: 1
+  sfp_window: 3
 
-# Deduplication settings
-dedupe_minutes: 30     # throttle repeats per symbol/TF/level/type
+dedupe_minutes: 30
