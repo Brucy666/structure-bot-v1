@@ -1,0 +1,21 @@
+exchange: bybit
+symbols: ["BTC/USDT", "ETH/USDT"]
+timeframes: ["3m", "12m", "1h"]
+lookback_bars: 600
+poll_seconds: 20
+discord_webhook_url: "PASTE_YOUR_DISCORD_WEBHOOK"
+
+impulse:
+  atr_len: 14
+  body_min: 0.55    # min body/true_range for a candle to count as impulsive
+  atr_mult: 1.2     # min candle true_range vs ATR
+  min_consecutive: 2
+
+zones:
+  max_zone_pct: 0.35  # cap zone thickness as % of impulse range
+
+signals:
+  confirm_closes: 1   # closes beyond level to confirm BOS
+  sfp_window: 3       # bars within which close must return inside after wick
+
+dedupe_minutes: 30     # throttle repeats per symbol/TF/level/typep
