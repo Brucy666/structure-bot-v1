@@ -1,50 +1,47 @@
 # Exchange
 exchange: bybit
 
-# Symbols and timeframes to scan
-symbols: ["BTC/USDT", "ETH/USDT"]
+# Symbols to scan (added SOL)
+symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 
-# Bybit-supported TFs: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d, 1w
+# Timeframes (Bybit-supported)
 timeframes: ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "12h"]
 
-# Number of candles to fetch per scan
+# Candles & loop
 lookback_bars: 800
-
-# Seconds between scans
 poll_seconds: 20
 
-# Discord webhook URL — leave blank for GitHub safety
-# On Railway, set as DISCORD_WEBHOOK_URL
+# Webhook is set on Railway as DISCORD_WEBHOOK_URL (keep blank here)
 discord_webhook_url: ""
 
-# Impulse detection settings
+# Impulse detection
 impulse:
-  atr_len: 14          # ATR length
-  body_min: 0.55       # min body/true_range for impulsive candle
-  atr_mult: 1.2        # min true_range vs ATR
-  min_consecutive: 2   # min consecutive impulsive candles
+  atr_len: 14
+  body_min: 0.55
+  atr_mult: 1.2
+  min_consecutive: 2
 
 # Zone settings
 zones:
-  max_zone_pct: 0.35   # max zone thickness as % of impulse range
+  max_zone_pct: 0.35
 
 # Signal detection
 signals:
-  confirm_closes: 1    # closes beyond level to confirm BOS
-  sfp_window: 3        # bars to close back inside after wick
+  confirm_closes: 1
+  sfp_window: 3
 
-# Trade plan risk settings
+# Trade plan (for LONG/SHORT alerts)
 risk:
-  retest_offset_pct: 0.03   # % beyond level for retest entry
-  stop_atr_mult: 1.2        # stop = ATR*mult beyond level
-  tp_rr: 1.5                # TP1 = R-multiple
+  retest_offset_pct: 0.03
+  stop_atr_mult: 1.2
+  tp_rr: 1.5
 
-# Deduplication
-dedupe_minutes: 30          # throttle same alert
+# Deduping
+dedupe_minutes: 30
 
-# Debug / heartbeat settings
+# Debug / visibility
 debug:
-  log_scans: true           # print each symbol/TF scan in logs
-  log_zones: true           # print detected zone bounds in logs
-  heartbeat_minutes: 1      # “still alive” message every N minutes
-  post_debug_to_discord: false  # if true, post debug zones to Discord
+  log_scans: true
+  log_zones: true
+  heartbeat_minutes: 1
+  post_debug_to_discord: false   # set to true if you want “Watching…” embeds in Discord
