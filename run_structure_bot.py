@@ -37,20 +37,38 @@ def make_payload(symbol, timeframe, cfg, zone, sig, candles):
 
 if __name__ == "__main__":
     cfg = load_cfg()
-    # 🔹 Updated: use DISCORD_WEBHOOK_URL env var if set, fallback to config.yml
-    webhook_url = os.environ.get('DISCORD_WEBHOOK_URL') or cfg.get('discord_webhook_url', '')
-    notify = Notifier(webhook_url)
-
     feed = DataFeed(cfg['exchange'])
     engine = StructureEngine(cfg)
+
+    # 🔹 use env var webhook if present (Railway), else config
+    webhook_url = os.environ.get('DISCORD_WEBHOOK_URL') or cfg.get('discord_webhook_url', '')
+    notify = Notifier(webhook_url)
     state = State()
+
+    # 🔹 Determine supported timeframes from exchange (if provided by ccxt)
+    supported_tfs = set((feed.exchange.timeframes or {}).keys())
+    requested_tfs = cfg['timeframes']
+
+    # If ccxt lists timeframes, filter to supported ones
+    if supported_tfs:
+        valid_tfs = [tf for tf in requested_tfs if tf in supported_tfs]
+        if not valid_tfs:
+            print(f"[WARN] None of the requested timeframes are supported by {cfg['exchange']}. "
+                  f"Supported: {sorted(supported_tfs)}")
+            valid_tfs = requested_tfs  # fall back to try anyway
+    else:
+        valid_tfs = requested_tfs
+
+    print(f"[INFO] Using timeframes: {valid_tfs}")
 
     while True:
         for symbol in cfg['symbols']:
-            for tf in cfg['timeframes']:
+            for tf in valid_tfs:
                 try:
                     ohlcv = feed.fetch_ohlcv(symbol, tf, limit=cfg['lookback_bars'])
                     candles = to_candles(ohlcv)
+                    if len(candles) < 20:
+                        continue
 
                     impulse = engine.detect_last_impulse(candles)
                     zone = engine.make_zone_from_impulse(candles, impulse)
@@ -68,7 +86,7 @@ if __name__ == "__main__":
                             notify.post(make_payload(symbol, tf, cfg, zone, sig, candles))
 
                 except Exception as e:
-                    print(f"[ERR] {symbol} {tf}: {e}")
+                    print(f"[ERR] {symbol} {tf} ({cfg['exchange']}): {e}")
                     continue
 
         time.sleep(cfg['poll_seconds'])
