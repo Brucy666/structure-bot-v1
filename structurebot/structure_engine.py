@@ -26,6 +26,7 @@ class Zone:
     bottom: float
     top: float
     impulse_end_idx: int
+    strength: float = 1.0     # AI-touch: impulse-strength proxy
 
 class StructureEngine:
     def __init__(self, cfg):
@@ -40,8 +41,7 @@ class StructureEngine:
         return t, o, h, l, c
 
     def detect_last_impulse(self, candles: List[Candle]) -> Optional[Impulse]:
-        if len(candles) < 5:
-            return None
+        if len(candles) < 5: return None
         t, o, h, l, c = self._to_arrays(candles)
         length = self.cfg['impulse']['atr_len']
         body_min = self.cfg['impulse']['body_min']
@@ -51,112 +51,108 @@ class StructureEngine:
         a = atr(o, h, l, c, length)
         bodies = np.abs(c - o)
         trange = h - l
-        trange_safe = np.where(trange == 0, 1e-9, trange)
-        body_frac = bodies / trange_safe
+        tr_safe = np.where(trange == 0, 1e-9, trange)
+        body_frac = bodies / tr_safe
         direction = np.where(c >= o, 1, -1)
 
         # scan backward for most recent run of impulsive candles
-        i = len(c) - 1
-        end = i
-        consec = 1
-
-        def candle_ok(idx):
-            if idx < 0 or idx >= len(c):
-                return False
-            bf = body_frac[idx]
+        end = len(c) - 1
+        # find a last candle that meets criteria; skip tiny last bar
+        def ok(idx):
+            if idx < 0 or idx >= len(c): return False
             tr_ok = (h[idx] - l[idx]) >= atr_mult * (a[idx] if not np.isnan(a[idx]) else 0)
-            return (bf >= body_min) and tr_ok
+            return (body_frac[idx] >= body_min) and tr_ok
 
-        # ensure last candle meets criteria
-        if not candle_ok(end):
-            # try one step back (sometimes the last bar is small)
+        while end >= 0 and not ok(end):
             end -= 1
-            if end < 0 or not candle_ok(end):
-                return None
+        if end < 0: return None
 
-        i = end
-        while i > 0 and direction[i] == direction[i-1] and candle_ok(i-1):
-            consec += 1
-            i -= 1
-
-        if consec < min_consec:
-            return None
+        i = end; consec = 1
+        while i > 0 and direction[i] == direction[i-1] and ok(i-1):
+            consec += 1; i -= 1
+        if consec < min_consec: return None
 
         start = i
         dir_str = 'up' if direction[end] == 1 else 'down'
         rng = (h[end] - l[end])
-        return Impulse(
-            direction=dir_str,
-            start_idx=start,
-            end_idx=end,
-            body_fraction=float(np.nanmean(body_frac[start:end+1])),
-            range_points=float(rng)
-        )
+        return Impulse(direction=dir_str, start_idx=start, end_idx=end,
+                       body_fraction=float(np.nanmean(body_frac[start:end+1])),
+                       range_points=float(rng))
 
     def make_zone_from_impulse(self, candles: List[Candle], impulse: Impulse) -> Optional[Zone]:
-        if impulse is None:
-            return None
+        if impulse is None: return None
         last = candles[impulse.end_idx]
         if impulse.direction == 'up':
-            wick_low = last.l
-            body_low = min(last.o, last.c)
-            bottom, top = wick_low, body_low
-            kind = 'bullish'
+            wick_low = last.l; body_low = min(last.o, last.c)
+            bottom, top = wick_low, body_low; kind = 'bullish'
         else:
-            wick_high = last.h
-            body_high = max(last.o, last.c)
-            bottom, top = body_high, wick_high
-            kind = 'bearish'
+            wick_high = last.h; body_high = max(last.o, last.c)
+            bottom, top = body_high, wick_high; kind = 'bearish'
 
         max_pct = self.cfg['zones']['max_zone_pct']
         imp_range = max(impulse.range_points, 1e-9)
+        # cap thickness
         if (top - bottom) / imp_range > max_pct:
             mid = (top + bottom) / 2
             half = imp_range * max_pct / 2
             bottom, top = mid - half, mid + half
 
-        return Zone(kind=kind, bottom=float(bottom), top=float(top), impulse_end_idx=impulse.end_idx)
+        # AI-touch: strength proxy = (impulse body_fraction * impulse range) / zone thickness
+        thickness = max(top - bottom, 1e-9)
+        strength = (impulse.body_fraction * imp_range) / thickness
+        return Zone(kind=kind, bottom=float(bottom), top=float(top), impulse_end_idx=impulse.end_idx, strength=float(strength))
 
     def bos_signal(self, candles: List[Candle], zone: Zone):
-        if zone is None:
-            return None
+        if zone is None: return None
         confirm = self.cfg['signals']['confirm_closes']
         closes = [x.c for x in candles]
-
         if zone.kind == 'bearish':
-            idxs = [i for i in range(zone.impulse_end_idx + 1, len(candles)) if closes[i] > zone.top]
+            idxs = [i for i in range(zone.impulse_end_idx+1, len(candles)) if closes[i] > zone.top]
             if len(idxs) >= confirm:
-                return {"type": "BOS", "direction": "bullish", "level": zone.top, "idx": idxs[-1]}
+                return {"type":"BOS","direction":"bullish","level":zone.top,"idx":idxs[-1]}
         else:
-            idxs = [i for i in range(zone.impulse_end_idx + 1, len(candles)) if closes[i] < zone.bottom]
+            idxs = [i for i in range(zone.impulse_end_idx+1, len(candles)) if closes[i] < zone.bottom]
             if len(idxs) >= confirm:
-                return {"type": "BOS", "direction": "bearish", "level": zone.bottom, "idx": idxs[-1]}
+                return {"type":"BOS","direction":"bearish","level":zone.bottom,"idx":idxs[-1]}
         return None
 
     def sfp_signal(self, candles: List[Candle], zone: Zone):
-        if zone is None:
-            return None
+        if zone is None: return None
         w = self.cfg['signals']['sfp_window']
-        if w <= 0:
-            return None
+        if w <= 0: return None
 
         closes = [x.c for x in candles]
         highs  = [x.h for x in candles]
         lows   = [x.l for x in candles]
         start = zone.impulse_end_idx + 1
 
+        min_pen = self.cfg['sfp_quality']['min_penetration_pct']
+        max_inside = self.cfg['sfp_quality']['max_close_inside_pct']
+
         if zone.kind == 'bearish':
             for i in range(start, len(candles)):
                 if highs[i] > zone.top and closes[i] <= zone.top:
-                    return {"type": "SFP", "direction": "bearish-failed-break", "level": zone.top, "idx": i}
+                    pen = (highs[i] - zone.top) / zone.top
+                    inside = abs(closes[i] - zone.top) / zone.top
+                    if pen >= min_pen and inside <= max_inside:
+                        return {'type':'SFP','direction':'bearish-failed-break','level':zone.top,'idx':i}
                 for j in range(i+1, min(i+1+w, len(candles))):
                     if highs[i] > zone.top and closes[j] <= zone.top:
-                        return {"type": "SFP", "direction": "bearish-failed-break", "level": zone.top, "idx": j}
+                        pen = (highs[i] - zone.top) / zone.top
+                        inside = abs(closes[j] - zone.top) / zone.top
+                        if pen >= min_pen and inside <= max_inside:
+                            return {'type':'SFP','direction':'bearish-failed-break','level':zone.top,'idx':j}
         else:
             for i in range(start, len(candles)):
                 if lows[i] < zone.bottom and closes[i] >= zone.bottom:
-                    return {"type": "SFP", "direction": "bullish-failed-break", "level": zone.bottom, "idx": i}
+                    pen = (zone.bottom - lows[i]) / zone.bottom
+                    inside = abs(closes[i] - zone.bottom) / zone.bottom
+                    if pen >= min_pen and inside <= max_inside:
+                        return {'type':'SFP','direction':'bullish-failed-break','level':zone.bottom,'idx':i}
                 for j in range(i+1, min(i+1+w, len(candles))):
                     if lows[i] < zone.bottom and closes[j] >= zone.bottom:
-                        return {"type": "SFP", "direction": "bullish-failed-break", "level": zone.bottom, "idx": j}
+                        pen = (zone.bottom - lows[i]) / zone.bottom
+                        inside = abs(closes[j] - zone.bottom) / zone.bottom
+                        if pen >= min_pen and inside <= max_inside:
+                            return {'type':'SFP','direction':'bullish-failed-break','level':zone.bottom,'idx':j}
         return None
