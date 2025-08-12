@@ -4,36 +4,36 @@ exchange: bybit
 # Pairs
 symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 
-# Timeframes (curated for signal quality)
+# Timeframes
 timeframes: ["1m", "5m", "15m", "1h", "4h"]
 
-# Candles & loop
+# Runtime
 lookback_bars: 900
 poll_seconds: 30
 
-# Webhook (keep blank; set DISCORD_WEBHOOK_URL on Railway)
+# Discord webhook (keep blank in repo; set DISCORD_WEBHOOK_URL on Railway)
 discord_webhook_url: ""
 
-# Impulse detection (base thresholds; adapted by regime below)
+# ---- Loosened impulse detection (to guarantee zones) ----
 impulse:
   atr_len: 14
-  body_min: 0.60
-  atr_mult: 1.30
+  body_min: 0.40         # was 0.60
+  atr_mult: 1.05         # was 1.30
   min_consecutive: 2
 
-# Zone settings
+# Zones
 zones:
   max_zone_pct: 0.30
 
-# Signal detection
+# Signals
 signals:
   confirm_closes: 1
-  sfp_window: 3
+  sfp_window: 4          # was 3
 
-# 🔹 SFP quality (AI touch)
+# ---- Loosened SFP quality (to allow more historical hits) ----
 sfp_quality:
-  min_penetration_pct: 0.03   # wick must pass level by ≥0.03%
-  max_close_inside_pct: 0.02  # close must finish back within 0.02% of level
+  min_penetration_pct: 0.010   # was 0.03
+  max_close_inside_pct: 0.050  # was 0.02
 
 # Trade plan
 risk:
@@ -41,41 +41,41 @@ risk:
   stop_atr_mult: 1.2
   tp_rr: 1.6
 
-# 🔹 Filters (AI touch)
+# ---- Turn off gating filters for verification ----
 filters:
-  use_htf_bias: true
+  use_htf_bias: false
   htf_timeframe: "1h"
   session_filter: false
   sessions_utc: ["07:00-10:59", "13:30-20:59"]
 
-# 🔹 Regime adapt (AI touch)
+# Regime adapt (kept mild)
 regime:
   lookback: 200
   atr_ma_len: 50
   trend_ratio_min: 1.15
-  adapt_body_min: [0.55, 0.65]    # [ranging, trending]
-  adapt_atr_mult: [1.10, 1.40]    # [ranging, trending]
+  adapt_body_min: [0.50, 0.60]   # easier
+  adapt_atr_mult: [1.05, 1.25]   # easier
 
-# 🔹 Scoring (AI touch)
+# ---- Disable score gate so anything valid posts ----
 scoring:
-  w_bias: 0.30
+  w_bias: 0.20
   w_regime: 0.20
-  w_zone_strength: 0.25
-  w_signal_clean: 0.25
-  min_score_to_alert: 60
+  w_zone_strength: 0.30
+  w_signal_clean: 0.30
+  min_score_to_alert: 0          # ← forces alerts to send
 
-# 🔹 One‑time startup backfill (prove pipeline)
+# ---- One-time startup backfill (deeper) ----
 startup_backfill:
   enabled: true
-  lookback_bars: 1500
-  max_signals_per_market: 1   # post at most 1 recent signal per symbol/TF
+  lookback_bars: 3000            # was 1500
+  max_signals_per_market: 1
 
 # Deduping
 dedupe_minutes: 30
 
-# Debug (production‑friendly)
+# Debug (more visibility while testing)
 debug:
   log_scans: true
-  log_zones: false
-  heartbeat_minutes: 2
+  log_zones: true
+  heartbeat_minutes: 1
   post_debug_to_discord: false
