@@ -18,10 +18,8 @@ def load_cfg():
 
 
 def heartbeat(now_ts, last_ts, minutes: int):
-    if minutes <= 0:
-        return False, last_ts
-    if now_ts - last_ts >= minutes * 60:
-        return True, now_ts
+    if minutes <= 0: return False, last_ts
+    if now_ts - last_ts >= minutes * 60: return True, now_ts
     return False, last_ts
 
 
@@ -31,8 +29,7 @@ def in_session_utc(now_ts: float, sessions):
     cur = t.hour * 60 + t.minute
     for window in sessions:
         a, b = window.split("-")
-        ah, am = map(int, a.split(":"))
-        bh, bm = map(int, b.split(":"))
+        ah, am = map(int, a.split(":")); bh, bm = map(int, b.split(":"))
         if ah * 60 + am <= cur <= bh * 60 + bm:
             return True
     return False
@@ -52,14 +49,12 @@ def compute_bias_htf(feed, symbol, tf, bars=200):
     try:
         ohlcv = feed.fetch_ohlcv(symbol, tf, limit=bars)
         closes = [x[4] for x in ohlcv]
-        highs = [x[2] for x in ohlcv]
-        lows = [x[3] for x in ohlcv]
+        highs  = [x[2] for x in ohlcv]
+        lows   = [x[3] for x in ohlcv]
         swing_hi = max(highs[:-1]) if len(highs) > 1 else highs[-1]
         swing_lo = min(lows[:-1]) if len(lows) > 1 else lows[-1]
-        if closes[-1] > swing_hi:
-            return "bullish"
-        if closes[-1] < swing_lo:
-            return "bearish"
+        if closes[-1] > swing_hi: return "bullish"
+        if closes[-1] < swing_lo: return "bearish"
         return "neutral"
     except Exception:
         return "neutral"
@@ -124,17 +119,78 @@ def make_payload(symbol, timeframe, cfg, zone, sig, candles, plan, score, reason
     }
 
 
+def find_recent_signal(engine, candles, zone, cfg):
+    """
+    Replay BOS/SFP logic over history (post-impulse) and return
+    the most recent qualifying signal dict or None.
+    """
+    if not zone or not candles:
+        return None
+
+    closes = [x.c for x in candles]
+    highs  = [x.h for x in candles]
+    lows   = [x.l for x in candles]
+
+    # BOS
+    last_bos = None
+    if zone.kind == "bearish":
+        for i in range(zone.impulse_end_idx + 1, len(candles)):
+            if closes[i] > zone.top:
+                last_bos = {"type":"BOS","direction":"bullish","level":zone.top,"idx":i}
+    else:
+        for i in range(zone.impulse_end_idx + 1, len(candles)):
+            if closes[i] < zone.bottom:
+                last_bos = {"type":"BOS","direction":"bearish","level":zone.bottom,"idx":i}
+
+    # SFP (with quality)
+    last_sfp = None
+    w = cfg["signals"]["sfp_window"]
+    min_pen = cfg["sfp_quality"]["min_penetration_pct"]
+    max_inside = cfg["sfp_quality"]["max_close_inside_pct"]
+
+    if zone.kind == "bearish":
+        for i in range(zone.impulse_end_idx + 1, len(candles)):
+            if highs[i] > zone.top and closes[i] <= zone.top:
+                pen = (highs[i] - zone.top) / zone.top
+                inside = abs(closes[i] - zone.top) / zone.top
+                if pen >= min_pen and inside <= max_inside:
+                    last_sfp = {'type':'SFP','direction':'bearish-failed-break','level':zone.top,'idx':i}
+            for j in range(i+1, min(i+1+w, len(candles))):
+                if highs[i] > zone.top and closes[j] <= zone.top:
+                    pen = (highs[i] - zone.top) / zone.top
+                    inside = abs(closes[j] - zone.top) / zone.top
+                    if pen >= min_pen and inside <= max_inside:
+                        last_sfp = {'type':'SFP','direction':'bearish-failed-break','level':zone.top,'idx':j}
+    else:
+        for i in range(zone.impulse_end_idx + 1, len(candles)):
+            if lows[i] < zone.bottom and closes[i] >= zone.bottom:
+                pen = (zone.bottom - lows[i]) / zone.bottom
+                inside = abs(closes[i] - zone.bottom) / zone.bottom
+                if pen >= min_pen and inside <= max_inside:
+                    last_sfp = {'type':'SFP','direction':'bullish-failed-break','level':zone.bottom,'idx':i}
+            for j in range(i+1, min(i+1+w, len(candles))):
+                if lows[i] < zone.bottom and closes[j] >= zone.bottom:
+                    pen = (zone.bottom - lows[i]) / zone.bottom
+                    inside = abs(closes[j] - zone.bottom) / zone.bottom
+                    if pen >= min_pen and inside <= max_inside:
+                        last_sfp = {'type':'SFP','direction':'bullish-failed-break','level':zone.bottom,'idx':j}
+
+    if last_bos and last_sfp:
+        return last_bos if last_bos["idx"] > last_sfp["idx"] else last_sfp
+    return last_bos or last_sfp
+
+
 if __name__ == "__main__":
     cfg = load_cfg()
     feed = DataFeed(cfg["exchange"])
-    eng = StructureEngine(cfg)
-    notify = Notifier(os.environ.get("DISCORD_WEBHOOK_URL") or cfg.get("discord_webhook_url", ""))
-    state = State()
+    eng  = StructureEngine(cfg)
+    notify = Notifier(os.environ.get("DISCORD_WEBHOOK_URL") or cfg.get("discord_webhook_url",""))
+    state  = State()
 
     dbg = cfg.get("debug", {})
-    LOG_SCANS = bool(dbg.get("log_scans", True))
-    LOG_ZONES = bool(dbg.get("log_zones", False))
-    HEART_MIN = int(dbg.get("heartbeat_minutes", 2))
+    LOG_SCANS  = bool(dbg.get("log_scans", True))
+    LOG_ZONES  = bool(dbg.get("log_zones", False))
+    HEART_MIN  = int(dbg.get("heartbeat_minutes", 2))
     POST_DEBUG = bool(dbg.get("post_debug_to_discord", False))
 
     # Timeframes
@@ -159,6 +215,52 @@ if __name__ == "__main__":
         return None
     resolved_symbols = [s for s in (resolve_symbol(s) for s in cfg["symbols"]) if s]
     print(f"[INFO] Using symbols: {resolved_symbols}")
+
+    # -------- Startup backfill (optional) --------
+    if cfg.get("startup_backfill", {}).get("enabled", False):
+        bf_limit = int(cfg["startup_backfill"]["max_signals_per_market"])
+        bf_bars  = int(cfg["startup_backfill"]["lookback_bars"])
+        print(f"[BACKFILL] Starting (bars={bf_bars}, max_per_market={bf_limit})")
+
+        for symbol in resolved_symbols:
+            for tf in valid_tfs:
+                posted = 0
+                try:
+                    ohlcv = feed.fetch_ohlcv(symbol, tf, limit=bf_bars)
+                    candles = to_candles(ohlcv)
+                    if len(candles) < 50:
+                        print(f"[BACKFILL] {symbol} {tf} — not enough candles")
+                        continue
+
+                    impulse = eng.detect_last_impulse(candles)
+                    zone = eng.make_zone_from_impulse(candles, impulse)
+                    if not zone:
+                        print(f"[BACKFILL] {symbol} {tf} — no zone")
+                        continue
+
+                    sig = find_recent_signal(eng, candles, zone, cfg)
+                    if not sig:
+                        print(f"[BACKFILL] {symbol} {tf} — no recent BOS/SFP")
+                        continue
+
+                    plan = compute_trade_plan(cfg, candles, zone, sig)
+                    payload = make_payload(symbol, tf, cfg, zone, sig, candles, plan, score=99.0, reasons=["startup-backfill"])
+                    payload["embeds"][0]["title"] = "RECENT " + payload["embeds"][0]["title"]
+                    notify.post(payload)
+
+                    key = f"{symbol}:{tf}:{sig['type']}:{sig['direction']}:{round(sig['level'],2)}"
+                    state.can_alert(key, 0)  # prime dedupe
+                    posted += 1
+                    print(f"[BACKFILL] Posted RECENT {symbol} {tf}")
+                    if posted >= bf_limit:
+                        continue
+
+                except Exception as e:
+                    print(f"[BACKFILL ERR] {symbol} {tf}: {e}")
+                    continue
+
+        print("[BACKFILL] Done")
+    # --------------------------------------------
 
     last_heartbeat = 0
     while True:
@@ -218,12 +320,12 @@ if __name__ == "__main__":
                         if not sig:
                             continue
 
-                        # Trade plan (needed for cleanliness calc)
+                        # Trade plan (for cleanliness calc)
                         plan = compute_trade_plan(cfg, candles, zone, sig)
 
                         # Scoring
                         score = 0.0; reasons = []
-                        # bias
+                        # bias alignment
                         if bias != "neutral":
                             ok = (bias == "bullish" and sig["direction"].startswith("bullish")) or \
                                  (bias == "bearish" and sig["direction"].startswith("bearish"))
@@ -233,18 +335,18 @@ if __name__ == "__main__":
                         reg_ok = (reg == "trending" and sig["type"] == "BOS") or (reg == "ranging" and sig["type"] == "SFP")
                         score += cfg["scoring"]["w_regime"] * (100 if reg_ok else 0)
                         reasons.append(f"reg:{reg}{'✓' if reg_ok else '×'}")
-                        # zone strength proxy (computed in engine)
+                        # zone strength proxy
                         zs = getattr(zone, "strength", 1.0)
                         zs_norm = max(min(zs / 5.0, 1.0), 0.0)
                         score += cfg["scoring"]["w_zone_strength"] * (zs_norm * 100)
                         reasons.append(f"zone:{zs_norm:.2f}")
                         # signal cleanliness
+                        last_close = candles[sig["idx"]].c
                         if sig["type"] == "BOS":
-                            last_close = candles[sig["idx"]].c
                             dist_atr = abs(last_close - sig["level"]) / max(1e-9, plan["atr"])
-                            clean = max(min(dist_atr / 1.0, 1.0), 0.0)  # ≥1 ATR beyond = very clean
+                            clean = max(min(dist_atr / 1.0, 1.0), 0.0)  # ~1 ATR beyond = very clean
                         else:
-                            clean = 1.0  # SFP already quality-checked in engine
+                            clean = 1.0  # SFP already quality-filtered
                         score += cfg["scoring"]["w_signal_clean"] * (clean * 100)
                         reasons.append(f"clean:{clean:.2f}")
 
