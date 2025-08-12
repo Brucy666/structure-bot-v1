@@ -11,26 +11,26 @@ timeframes: ["1m", "5m", "15m", "1h", "4h"]
 lookback_bars: 900
 poll_seconds: 30
 
-# Webhook (keep blank in GitHub; use DISCORD_WEBHOOK_URL on Railway)
+# Webhook (keep blank; set DISCORD_WEBHOOK_URL on Railway)
 discord_webhook_url: ""
 
-# Impulse detection (base thresholds; may be adapted by regime below)
+# Impulse detection (base thresholds; adapted by regime below)
 impulse:
   atr_len: 14
-  body_min: 0.60        # stricter for cleaner impulses
+  body_min: 0.60
   atr_mult: 1.30
   min_consecutive: 2
 
 # Zone settings
 zones:
-  max_zone_pct: 0.30    # tighter zones relative to impulse range
+  max_zone_pct: 0.30
 
 # Signal detection
 signals:
   confirm_closes: 1
   sfp_window: 3
 
-# SFP quality (AI touch)
+# 🔹 SFP quality (AI touch)
 sfp_quality:
   min_penetration_pct: 0.03   # wick must pass level by ≥0.03%
   max_close_inside_pct: 0.02  # close must finish back within 0.02% of level
@@ -41,22 +41,22 @@ risk:
   stop_atr_mult: 1.2
   tp_rr: 1.6
 
-# Filters (AI touch)
+# 🔹 Filters (AI touch)
 filters:
   use_htf_bias: true
   htf_timeframe: "1h"
   session_filter: false
-  sessions_utc: ["07:00-10:59", "13:30-20:59"]  # London open, US cash
+  sessions_utc: ["07:00-10:59", "13:30-20:59"]
 
-# Regime adapt (AI touch)
+# 🔹 Regime adapt (AI touch)
 regime:
   lookback: 200
   atr_ma_len: 50
-  trend_ratio_min: 1.15           # ATR / ATR_MA > 1.15 ⇒ trending
+  trend_ratio_min: 1.15
   adapt_body_min: [0.55, 0.65]    # [ranging, trending]
-  adapt_atr_mult: [1.1, 1.4]      # [ranging, trending]
+  adapt_atr_mult: [1.10, 1.40]    # [ranging, trending]
 
-# Scoring (AI touch)
+# 🔹 Scoring (AI touch)
 scoring:
   w_bias: 0.30
   w_regime: 0.20
@@ -64,10 +64,16 @@ scoring:
   w_signal_clean: 0.25
   min_score_to_alert: 60
 
+# 🔹 One‑time startup backfill (prove pipeline)
+startup_backfill:
+  enabled: true
+  lookback_bars: 1500
+  max_signals_per_market: 1   # post at most 1 recent signal per symbol/TF
+
 # Deduping
 dedupe_minutes: 30
 
-# Debug (production‑friendly defaults)
+# Debug (production‑friendly)
 debug:
   log_scans: true
   log_zones: false
