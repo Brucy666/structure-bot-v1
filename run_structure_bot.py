@@ -7,10 +7,11 @@ from structurebot.utils import to_candles
 from structurebot.notifier import Notifier
 from structurebot.state import State
 from structurebot.indicators import atr
+from structurebot.db import DB
 
 CONFIG_FILE = os.environ.get("STRUCTURE_CONFIG", "config.yml")
 
-# ----------------- helpers -----------------
+# ---------- helpers ----------
 def load_cfg():
     with open(CONFIG_FILE, "r") as f:
         return yaml.safe_load(f)
@@ -112,7 +113,6 @@ def make_payload(symbol, timeframe, cfg, zone, sig, candles, plan, score, reason
     }
 
 def find_recent_signal(engine, candles, zone, cfg):
-    """Replays BOS/SFP historically and returns the most recent qualifying signal."""
     if not zone or not candles: return None
     closes = [x.c for x in candles]; highs = [x.h for x in candles]; lows = [x.l for x in candles]
 
@@ -127,7 +127,7 @@ def find_recent_signal(engine, candles, zone, cfg):
             if closes[i] < zone.bottom:
                 last_bos = {"type":"BOS","direction":"bearish","level":zone.bottom,"idx":i}
 
-    # SFP with quality filters
+    # SFP with quality
     last_sfp = None
     w = cfg["signals"]["sfp_window"]
     min_pen = cfg["sfp_quality"]["min_penetration_pct"]
@@ -164,13 +164,14 @@ def find_recent_signal(engine, candles, zone, cfg):
         return last_bos if last_bos["idx"] > last_sfp["idx"] else last_sfp
     return last_bos or last_sfp
 
-# ----------------- main -----------------
+# ---------- main ----------
 if __name__ == "__main__":
     cfg = load_cfg()
     feed = DataFeed(cfg["exchange"])
     eng  = StructureEngine(cfg)
     notify = Notifier(os.environ.get("DISCORD_WEBHOOK_URL") or cfg.get("discord_webhook_url",""))
     state  = State()
+    db     = DB()
 
     dbg = cfg.get("debug", {})
     LOG_SCANS  = bool(dbg.get("log_scans", True))
@@ -178,13 +179,11 @@ if __name__ == "__main__":
     HEART_MIN  = int(dbg.get("heartbeat_minutes", 2))
     POST_DEBUG = bool(dbg.get("post_debug_to_discord", False))
 
-    # Timeframes
     supported_tfs = set((feed.exchange.timeframes or {}).keys())
     req_tfs = cfg["timeframes"]
     valid_tfs = [tf for tf in req_tfs if not supported_tfs or tf in supported_tfs] or req_tfs
     print(f"[INFO] Using timeframes: {valid_tfs}")
 
-    # Symbols (spot ↔ perp resolve)
     markets = feed.exchange.load_markets()
     def resolve_symbol(sym: str):
         if sym in markets: return sym
@@ -201,7 +200,7 @@ if __name__ == "__main__":
     resolved_symbols = [s for s in (resolve_symbol(s) for s in cfg["symbols"]) if s]
     print(f"[INFO] Using symbols: {resolved_symbols}")
 
-    # -------- Startup backfill (REAL impulses only) --------
+    # ---- Startup backfill (REAL impulses only) ----
     if cfg.get("startup_backfill", {}).get("enabled", False):
         bf_limit = int(cfg["startup_backfill"]["max_signals_per_market"])
         bf_bars  = int(cfg["startup_backfill"]["lookback_bars"])
@@ -223,6 +222,8 @@ if __name__ == "__main__":
                         print(f"[BACKFILL] {symbol} {tf} — no zone")
                         continue
 
+                    if LOG_ZONES: db.log_zone(symbol, tf, zone)
+
                     sig = find_recent_signal(eng, candles, zone, cfg)
                     if not sig:
                         print(f"[BACKFILL] {symbol} {tf} — no recent BOS/SFP")
@@ -234,9 +235,9 @@ if __name__ == "__main__":
                     payload["embeds"][0]["title"] = "RECENT " + payload["embeds"][0]["title"]
                     notify.post(payload)
 
-                    # prime dedupe
-                    key = f"{symbol}:{tf}:{sig['type']}:{sig['direction']}:{round(sig['level'],2)}"
-                    state.can_alert(key, 0)
+                    dedupe_key = f"{symbol}:{tf}:{sig['type']}:{sig['direction']}:{round(sig['level'],2)}"
+                    db.log_signal(symbol, tf, sig, zone, plan, 99.0, ["startup-backfill"], True, dedupe_key)
+                    state.can_alert(dedupe_key, 0)
                     posted += 1
                     print(f"[BACKFILL] Posted RECENT {symbol} {tf}")
                     if posted >= bf_limit:
@@ -247,7 +248,6 @@ if __name__ == "__main__":
                     continue
 
         print("[BACKFILL] Done")
-    # ------------------------------------------------------
 
     last_heartbeat = 0
     while True:
@@ -261,13 +261,13 @@ if __name__ == "__main__":
                         if LOG_SCANS: print(f"[SKIP] {symbol} {tf} — not enough candles")
                         continue
 
-                    # Session filter
+                    # session filter
                     if cfg["filters"]["session_filter"]:
                         if not in_session_utc(time.time(), cfg["filters"]["sessions_utc"]):
                             if LOG_SCANS: print(f"[SKIP] {symbol} {tf} — out of session")
                             continue
 
-                    # Regime adapt
+                    # regime adapt
                     import numpy as np
                     o = np.array([x.o for x in candles], float)
                     h = np.array([x.h for x in candles], float)
@@ -287,19 +287,16 @@ if __name__ == "__main__":
                         bias_tf = cfg["filters"]["htf_timeframe"]
                         bias = compute_bias_htf(feed, symbol, bias_tf)
 
-                    # Structure → zone
+                    # structure → zone
                     impulse = eng.detect_last_impulse(candles)
                     zone = eng.make_zone_from_impulse(candles, impulse)
                     if not zone:
                         if LOG_SCANS: print(f"[WAIT] {symbol} {tf} — no valid impulse/zone yet")
-                        if POST_DEBUG:
-                            notify.post({"username":"StructureBot (debug)",
-                                         "embeds":[{"title":f"Watching {symbol} {tf}",
-                                                    "description":"No valid impulse/zone yet."}]})
                         continue
 
                     if LOG_ZONES:
                         print(f"[ZONE] {symbol} {tf} — {zone.kind} {zone.bottom:.2f} → {zone.top:.2f}")
+                        db.log_zone(symbol, tf, zone)
 
                     bos = eng.bos_signal(candles, zone)
                     sfp = eng.sfp_signal(candles, zone)
@@ -310,7 +307,7 @@ if __name__ == "__main__":
 
                         plan = compute_trade_plan(cfg, candles, zone, sig)
 
-                        # --- scoring ---
+                        # scoring
                         score = 0.0; reasons = []
                         if bias != "neutral":
                             ok = (bias == "bullish" and sig["direction"].startswith("bullish")) or \
@@ -332,21 +329,22 @@ if __name__ == "__main__":
                             clean = 1.0
                         score += cfg["scoring"]["w_signal_clean"] * (clean * 100)
                         reasons.append(f"clean:{clean:.2f}")
-                        final_score = round(score, 1)
 
+                        final_score = round(score, 1)
                         if final_score < cfg["scoring"]["min_score_to_alert"]:
                             if LOG_SCANS:
                                 print(f"[FILTER] {symbol} {tf} {sig['type']} score {final_score} < {cfg['scoring']['min_score_to_alert']}")
                             continue
 
-                        # Dedupe & send
-                        key = f"{symbol}:{tf}:{sig['type']}:{sig['direction']}:{round(sig['level'],2)}"
-                        if not state.can_alert(key, cfg["dedupe_minutes"]):
-                            if LOG_SCANS: print(f"[DEDUPE] {key} — throttled")
+                        # dedupe + send + log
+                        dedupe_key = f"{symbol}:{tf}:{sig['type']}:{sig['direction']}:{round(sig['level'],2)}"
+                        if not state.can_alert(dedupe_key, cfg["dedupe_minutes"]):
+                            if LOG_SCANS: print(f"[DEDUPE] {dedupe_key} — throttled")
                             continue
 
                         payload = make_payload(symbol, tf, cfg, zone, sig, candles, plan, final_score, reasons)
                         notify.post(payload)
+                        db.log_signal(symbol, tf, sig, zone, plan, final_score, reasons, False, dedupe_key)
                         print(f"[ALERT] {symbol} {tf} — {sig['type']} {sig['direction']} → {plan['side']} | score {final_score}")
 
                 except Exception as e:
