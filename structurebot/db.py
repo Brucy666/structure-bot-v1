@@ -1,5 +1,5 @@
 import os, time
-from typing import Optional
+from typing import Optional, Dict, Any
 
 try:
     from supabase import create_client, Client
@@ -25,15 +25,15 @@ class DB:
             except Exception as e:
                 last = e
                 time.sleep(0.4)
-        print(f"[DB] insert error: {last}")
+        print(f"[DB] error: {last}")
 
-    def log_zone(self, symbol, tf, zone):
-        return self._try(lambda: self.client.table("zones").insert({
+    def upsert_zone(self, symbol, tf, zone):
+        return self._try(lambda: self.client.table("zones").upsert({
             "symbol": symbol, "timeframe": tf, "kind": zone.kind,
             "top": float(zone.top), "bottom": float(zone.bottom),
             "impulse_end_idx": int(zone.impulse_end_idx),
             "strength": float(getattr(zone, "strength", 1.0))
-        }).execute())
+        }, on_conflict="symbol,timeframe,kind,top,bottom").execute())
 
     def log_signal(self, symbol, tf, sig, zone, plan, score, reasons, is_backfill, dedupe_key):
         return self._try(lambda: self.client.table("signals").insert({
@@ -46,3 +46,6 @@ class DB:
             "reasons": ",".join(reasons), "is_backfill": bool(is_backfill),
             "dedupe_key": dedupe_key
         }).execute())
+
+    def update_signal(self, signal_id: int, fields: Dict[str, Any]):
+        return self._try(lambda: self.client.table("signals").update(fields).eq("id", signal_id).execute())
