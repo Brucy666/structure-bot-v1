@@ -27,17 +27,15 @@ class StructureEngine:
     def __init__(self, cfg): self.cfg = cfg
 
     def _to_arrays(self, candles: List[Candle]):
-        import numpy as np
         o = np.array([x.o for x in candles], float)
         h = np.array([x.h for x in candles], float)
         l = np.array([x.l for x in candles], float)
         c = np.array([x.c for x in candles], float)
-        t = np.array([x.ts for x in candles], np.int64)
-        return t, o, h, l, c
+        return o, h, l, c
 
     def detect_last_impulse(self, candles: List[Candle]) -> Optional[Impulse]:
         if len(candles) < 5: return None
-        t, o, h, l, c = self._to_arrays(candles)
+        o, h, l, c = self._to_arrays(candles)
         length = self.cfg['impulse']['atr_len']
         body_min = self.cfg['impulse']['body_min']
         atr_mult = self.cfg['impulse']['atr_mult']
@@ -75,11 +73,9 @@ class StructureEngine:
         if impulse is None: return None
         last = candles[impulse.end_idx]
         if impulse.direction == 'up':
-            wick_low = last.l; body_low = min(last.o, last.c)
-            bottom, top = wick_low, body_low; kind = 'bullish'
+            bottom, top = last.l, min(last.o, last.c); kind = 'bullish'
         else:
-            wick_high = last.h; body_high = max(last.o, last.c)
-            bottom, top = body_high, wick_high; kind = 'bearish'
+            bottom, top = max(last.o, last.c), last.h; kind = 'bearish'
 
         max_pct = self.cfg['zones']['max_zone_pct']
         imp_range = max(impulse.range_points, 1e-9)
@@ -109,7 +105,7 @@ class StructureEngine:
 
     def sfp_signal(self, candles: List[Candle], zone: Zone):
         if zone is None: return None
-        w = self.cfg['signals']['sfp_window']; 
+        w = self.cfg['signals']['sfp_window']
         if w <= 0: return None
         closes = [x.c for x in candles]; highs = [x.h for x in candles]; lows = [x.l for x in candles]
         start = zone.impulse_end_idx + 1
