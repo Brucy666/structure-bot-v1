@@ -271,7 +271,7 @@ if __name__ == "__main__":
                     print(f"[ERR] {sym} {tf} ({cfg['exchange']}): {e}")
 
         now = time.time()
-        ping, last_hb = heartbeat(now, last_hb, HEART_MIN=cfg["debug"]["heartbeat_minutes"])
+        ping, last_hb = heartbeat(now, last_hb, cfg["debug"]["heartbeat_minutes"])
         if ping:
             print(f"[HEARTBEAT] {datetime.now(timezone.utc).isoformat()} — OK, sleeping {cfg['poll_seconds']}s")
         time.sleep(cfg["poll_seconds"])
