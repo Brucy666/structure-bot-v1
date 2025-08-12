@@ -1,81 +1,76 @@
-# Exchange
 exchange: bybit
-
-# Pairs
 symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 
-# Timeframes
 timeframes: ["1m", "5m", "15m", "1h", "4h"]
 
-# Runtime
 lookback_bars: 900
 poll_seconds: 30
 
-# Discord webhook (keep blank in repo; set DISCORD_WEBHOOK_URL on Railway)
-discord_webhook_url: ""
+discord_webhook_url: ""   # use env var
 
-# ---- Loosened impulse detection (to guarantee zones) ----
 impulse:
   atr_len: 14
-  body_min: 0.40         # was 0.60
-  atr_mult: 1.05         # was 1.30
+  body_min: 0.60
+  atr_mult: 1.30
   min_consecutive: 2
 
-# Zones
 zones:
   max_zone_pct: 0.30
 
-# Signals
 signals:
   confirm_closes: 1
-  sfp_window: 4          # was 3
+  sfp_window: 3
 
-# ---- Loosened SFP quality (to allow more historical hits) ----
 sfp_quality:
-  min_penetration_pct: 0.010   # was 0.03
-  max_close_inside_pct: 0.050  # was 0.02
+  min_penetration_pct: 0.02
+  max_close_inside_pct: 0.02
 
-# Trade plan
 risk:
   retest_offset_pct: 0.03
   stop_atr_mult: 1.2
   tp_rr: 1.6
 
-# ---- Turn off gating filters for verification ----
 filters:
-  use_htf_bias: false
+  use_htf_bias: true
   htf_timeframe: "1h"
   session_filter: false
-  sessions_utc: ["07:00-10:59", "13:30-20:59"]
+  sessions_utc: ["07:00-10:59","13:30-20:59"]
 
-# Regime adapt (kept mild)
 regime:
   lookback: 200
   atr_ma_len: 50
   trend_ratio_min: 1.15
-  adapt_body_min: [0.50, 0.60]   # easier
-  adapt_atr_mult: [1.05, 1.25]   # easier
+  adapt_body_min: [0.55, 0.65]
+  adapt_atr_mult: [1.10, 1.40]
 
-# ---- Disable score gate so anything valid posts ----
 scoring:
-  w_bias: 0.20
+  w_bias: 0.30
   w_regime: 0.20
-  w_zone_strength: 0.30
-  w_signal_clean: 0.30
-  min_score_to_alert: 0          # ← forces alerts to send
+  w_zone_strength: 0.25
+  w_signal_clean: 0.25
+  min_score_to_alert: 55
+  tf_overrides:
+    "1m": 60
+    "5m": 55
+    "15m": 55
+    "1h": 50
+    "4h": 50
 
-# ---- One-time startup backfill (deeper) ----
 startup_backfill:
   enabled: true
-  lookback_bars: 3000            # was 1500
+  lookback_bars: 1500
   max_signals_per_market: 1
 
-# Deduping
 dedupe_minutes: 30
 
-# Debug (more visibility while testing)
+outcomes:
+  poll_seconds: 45
+  max_age_hours: 24
+  miss_after_hours: 6
+  tf_for_check: "1m"
+
 debug:
   log_scans: true
-  log_zones: true
-  heartbeat_minutes: 1
+  log_zones: false
+  heartbeat_minutes: 2
   post_debug_to_discord: false
