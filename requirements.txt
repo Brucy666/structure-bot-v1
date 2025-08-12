@@ -2,3 +2,6 @@ ccxt
 numpy
 PyYAML
 requests
+httpx
+pydantic
+supabase
