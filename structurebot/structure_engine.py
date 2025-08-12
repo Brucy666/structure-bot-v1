@@ -5,16 +5,11 @@ from .indicators import atr
 
 @dataclass
 class Candle:
-    ts: int
-    o: float
-    h: float
-    l: float
-    c: float
-    v: float
+    ts: int; o: float; h: float; l: float; c: float; v: float
 
 @dataclass
 class Impulse:
-    direction: str   # 'up' or 'down'
+    direction: str   # 'up'|'down'
     start_idx: int
     end_idx: int
     body_fraction: float
@@ -22,17 +17,17 @@ class Impulse:
 
 @dataclass
 class Zone:
-    kind: str        # 'bullish' (from up impulse) or 'bearish' (from down impulse)
+    kind: str        # 'bullish'|'bearish'
     bottom: float
     top: float
     impulse_end_idx: int
-    strength: float = 1.0     # AI-touch: impulse-strength proxy
+    strength: float = 1.0
 
 class StructureEngine:
-    def __init__(self, cfg):
-        self.cfg = cfg
+    def __init__(self, cfg): self.cfg = cfg
 
     def _to_arrays(self, candles: List[Candle]):
+        import numpy as np
         o = np.array([x.o for x in candles], float)
         h = np.array([x.h for x in candles], float)
         l = np.array([x.l for x in candles], float)
@@ -50,21 +45,18 @@ class StructureEngine:
 
         a = atr(o, h, l, c, length)
         bodies = np.abs(c - o)
-        trange = h - l
-        tr_safe = np.where(trange == 0, 1e-9, trange)
-        body_frac = bodies / tr_safe
+        tr = h - l
+        tr = np.where(tr == 0, 1e-9, tr)
+        body_frac = bodies / tr
         direction = np.where(c >= o, 1, -1)
 
-        # scan backward for most recent run of impulsive candles
         end = len(c) - 1
-        # find a last candle that meets criteria; skip tiny last bar
-        def ok(idx):
-            if idx < 0 or idx >= len(c): return False
-            tr_ok = (h[idx] - l[idx]) >= atr_mult * (a[idx] if not np.isnan(a[idx]) else 0)
-            return (body_frac[idx] >= body_min) and tr_ok
+        def ok(i):
+            if i < 0 or i >= len(c): return False
+            tr_ok = (h[i] - l[i]) >= atr_mult * (a[i] if not np.isnan(a[i]) else 0)
+            return (body_frac[i] >= body_min) and tr_ok
 
-        while end >= 0 and not ok(end):
-            end -= 1
+        while end >= 0 and not ok(end): end -= 1
         if end < 0: return None
 
         i = end; consec = 1
@@ -91,16 +83,15 @@ class StructureEngine:
 
         max_pct = self.cfg['zones']['max_zone_pct']
         imp_range = max(impulse.range_points, 1e-9)
-        # cap thickness
         if (top - bottom) / imp_range > max_pct:
             mid = (top + bottom) / 2
             half = imp_range * max_pct / 2
             bottom, top = mid - half, mid + half
 
-        # AI-touch: strength proxy = (impulse body_fraction * impulse range) / zone thickness
         thickness = max(top - bottom, 1e-9)
         strength = (impulse.body_fraction * imp_range) / thickness
-        return Zone(kind=kind, bottom=float(bottom), top=float(top), impulse_end_idx=impulse.end_idx, strength=float(strength))
+        return Zone(kind=kind, bottom=float(bottom), top=float(top),
+                    impulse_end_idx=impulse.end_idx, strength=float(strength))
 
     def bos_signal(self, candles: List[Candle], zone: Zone):
         if zone is None: return None
@@ -118,14 +109,10 @@ class StructureEngine:
 
     def sfp_signal(self, candles: List[Candle], zone: Zone):
         if zone is None: return None
-        w = self.cfg['signals']['sfp_window']
+        w = self.cfg['signals']['sfp_window']; 
         if w <= 0: return None
-
-        closes = [x.c for x in candles]
-        highs  = [x.h for x in candles]
-        lows   = [x.l for x in candles]
+        closes = [x.c for x in candles]; highs = [x.h for x in candles]; lows = [x.l for x in candles]
         start = zone.impulse_end_idx + 1
-
         min_pen = self.cfg['sfp_quality']['min_penetration_pct']
         max_inside = self.cfg['sfp_quality']['max_close_inside_pct']
 
