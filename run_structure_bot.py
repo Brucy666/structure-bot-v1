@@ -10,9 +10,7 @@ from structurebot.indicators import atr
 
 CONFIG_FILE = os.environ.get("STRUCTURE_CONFIG", "config.yml")
 
-
 # ----------------- helpers -----------------
-
 def load_cfg():
     with open(CONFIG_FILE, "r") as f:
         return yaml.safe_load(f)
@@ -166,9 +164,7 @@ def find_recent_signal(engine, candles, zone, cfg):
         return last_bos if last_bos["idx"] > last_sfp["idx"] else last_sfp
     return last_bos or last_sfp
 
-
 # ----------------- main -----------------
-
 if __name__ == "__main__":
     cfg = load_cfg()
     feed = DataFeed(cfg["exchange"])
@@ -205,7 +201,7 @@ if __name__ == "__main__":
     resolved_symbols = [s for s in (resolve_symbol(s) for s in cfg["symbols"]) if s]
     print(f"[INFO] Using symbols: {resolved_symbols}")
 
-    # -------- Startup backfill (with force-zone) --------
+    # -------- Startup backfill (REAL impulses only) --------
     if cfg.get("startup_backfill", {}).get("enabled", False):
         bf_limit = int(cfg["startup_backfill"]["max_signals_per_market"])
         bf_bars  = int(cfg["startup_backfill"]["lookback_bars"])
@@ -221,17 +217,8 @@ if __name__ == "__main__":
                         print(f"[BACKFILL] {symbol} {tf} — not enough candles")
                         continue
 
-                    # Try normal impulse→zone
                     impulse = eng.detect_last_impulse(candles)
                     zone = eng.make_zone_from_impulse(candles, impulse)
-
-                    # 🔹 Force a test zone if none found (second-last full candle)
-                    if not zone and len(candles) > 5:
-                        last = candles[-2]
-                        zone = Zone(kind="bullish", bottom=last.l, top=last.h,
-                                    impulse_end_idx=len(candles)-2, strength=1.0)
-                        print(f"[BACKFILL] {symbol} {tf} — forced test zone {zone.bottom:.2f} → {zone.top:.2f}")
-
                     if not zone:
                         print(f"[BACKFILL] {symbol} {tf} — no zone")
                         continue
@@ -260,7 +247,7 @@ if __name__ == "__main__":
                     continue
 
         print("[BACKFILL] Done")
-    # ----------------------------------------------------
+    # ------------------------------------------------------
 
     last_heartbeat = 0
     while True:
