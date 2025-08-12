@@ -8,20 +8,19 @@ from structurebot.notifier import Notifier
 from structurebot.state import State
 from structurebot.indicators import atr
 
-
 CONFIG_FILE = os.environ.get("STRUCTURE_CONFIG", "config.yml")
 
+
+# ----------------- helpers -----------------
 
 def load_cfg():
     with open(CONFIG_FILE, "r") as f:
         return yaml.safe_load(f)
 
-
 def heartbeat(now_ts, last_ts, minutes: int):
     if minutes <= 0: return False, last_ts
     if now_ts - last_ts >= minutes * 60: return True, now_ts
     return False, last_ts
-
 
 def in_session_utc(now_ts: float, sessions):
     from datetime import datetime, timezone
@@ -34,7 +33,6 @@ def in_session_utc(now_ts: float, sessions):
             return True
     return False
 
-
 def compute_regime(o, h, l, c, cfg):
     import numpy as np
     a = atr(o, h, l, c, length=cfg["impulse"]["atr_len"])
@@ -43,7 +41,6 @@ def compute_regime(o, h, l, c, cfg):
     ma = np.nanmean(a[-cfg["regime"]["atr_ma_len"]:])
     ratio = (a[-1] / (ma if ma > 0 else 1e-9))
     return "trending" if ratio >= cfg["regime"]["trend_ratio_min"] else "ranging"
-
 
 def compute_bias_htf(feed, symbol, tf, bars=200):
     try:
@@ -58,7 +55,6 @@ def compute_bias_htf(feed, symbol, tf, bars=200):
         return "neutral"
     except Exception:
         return "neutral"
-
 
 def compute_trade_plan(cfg, candles, zone, sig):
     import numpy as np
@@ -92,7 +88,6 @@ def compute_trade_plan(cfg, candles, zone, sig):
     tp1 = entry + rr * risk_per if side == "LONG" else entry - rr * risk_per
     return {"side": side, "entry": float(entry), "stop": float(stop), "tp1": float(tp1), "atr": float(recent_atr)}
 
-
 def make_payload(symbol, timeframe, cfg, zone, sig, candles, plan, score, reasons):
     bar = candles[sig["idx"]]
     title = f"{sig['type']} — {symbol} {timeframe} ({plan['side']})"
@@ -118,18 +113,10 @@ def make_payload(symbol, timeframe, cfg, zone, sig, candles, plan, score, reason
         }]
     }
 
-
 def find_recent_signal(engine, candles, zone, cfg):
-    """
-    Replay BOS/SFP logic over history (post-impulse) and return
-    the most recent qualifying signal dict or None.
-    """
-    if not zone or not candles:
-        return None
-
-    closes = [x.c for x in candles]
-    highs  = [x.h for x in candles]
-    lows   = [x.l for x in candles]
+    """Replays BOS/SFP historically and returns the most recent qualifying signal."""
+    if not zone or not candles: return None
+    closes = [x.c for x in candles]; highs = [x.h for x in candles]; lows = [x.l for x in candles]
 
     # BOS
     last_bos = None
@@ -142,7 +129,7 @@ def find_recent_signal(engine, candles, zone, cfg):
             if closes[i] < zone.bottom:
                 last_bos = {"type":"BOS","direction":"bearish","level":zone.bottom,"idx":i}
 
-    # SFP (with quality)
+    # SFP with quality filters
     last_sfp = None
     w = cfg["signals"]["sfp_window"]
     min_pen = cfg["sfp_quality"]["min_penetration_pct"]
@@ -180,6 +167,8 @@ def find_recent_signal(engine, candles, zone, cfg):
     return last_bos or last_sfp
 
 
+# ----------------- main -----------------
+
 if __name__ == "__main__":
     cfg = load_cfg()
     feed = DataFeed(cfg["exchange"])
@@ -199,7 +188,7 @@ if __name__ == "__main__":
     valid_tfs = [tf for tf in req_tfs if not supported_tfs or tf in supported_tfs] or req_tfs
     print(f"[INFO] Using timeframes: {valid_tfs}")
 
-    # Symbols resolver (spot ↔ perp)
+    # Symbols (spot ↔ perp resolve)
     markets = feed.exchange.load_markets()
     def resolve_symbol(sym: str):
         if sym in markets: return sym
@@ -216,7 +205,7 @@ if __name__ == "__main__":
     resolved_symbols = [s for s in (resolve_symbol(s) for s in cfg["symbols"]) if s]
     print(f"[INFO] Using symbols: {resolved_symbols}")
 
-    # -------- Startup backfill (optional) --------
+    # -------- Startup backfill (with force-zone) --------
     if cfg.get("startup_backfill", {}).get("enabled", False):
         bf_limit = int(cfg["startup_backfill"]["max_signals_per_market"])
         bf_bars  = int(cfg["startup_backfill"]["lookback_bars"])
@@ -232,8 +221,17 @@ if __name__ == "__main__":
                         print(f"[BACKFILL] {symbol} {tf} — not enough candles")
                         continue
 
+                    # Try normal impulse→zone
                     impulse = eng.detect_last_impulse(candles)
                     zone = eng.make_zone_from_impulse(candles, impulse)
+
+                    # 🔹 Force a test zone if none found (second-last full candle)
+                    if not zone and len(candles) > 5:
+                        last = candles[-2]
+                        zone = Zone(kind="bullish", bottom=last.l, top=last.h,
+                                    impulse_end_idx=len(candles)-2, strength=1.0)
+                        print(f"[BACKFILL] {symbol} {tf} — forced test zone {zone.bottom:.2f} → {zone.top:.2f}")
+
                     if not zone:
                         print(f"[BACKFILL] {symbol} {tf} — no zone")
                         continue
@@ -244,12 +242,14 @@ if __name__ == "__main__":
                         continue
 
                     plan = compute_trade_plan(cfg, candles, zone, sig)
-                    payload = make_payload(symbol, tf, cfg, zone, sig, candles, plan, score=99.0, reasons=["startup-backfill"])
+                    payload = make_payload(symbol, tf, cfg, zone, sig, candles, plan,
+                                           score=99.0, reasons=["startup-backfill"])
                     payload["embeds"][0]["title"] = "RECENT " + payload["embeds"][0]["title"]
                     notify.post(payload)
 
+                    # prime dedupe
                     key = f"{symbol}:{tf}:{sig['type']}:{sig['direction']}:{round(sig['level'],2)}"
-                    state.can_alert(key, 0)  # prime dedupe
+                    state.can_alert(key, 0)
                     posted += 1
                     print(f"[BACKFILL] Posted RECENT {symbol} {tf}")
                     if posted >= bf_limit:
@@ -260,7 +260,7 @@ if __name__ == "__main__":
                     continue
 
         print("[BACKFILL] Done")
-    # --------------------------------------------
+    # ----------------------------------------------------
 
     last_heartbeat = 0
     while True:
@@ -307,7 +307,8 @@ if __name__ == "__main__":
                         if LOG_SCANS: print(f"[WAIT] {symbol} {tf} — no valid impulse/zone yet")
                         if POST_DEBUG:
                             notify.post({"username":"StructureBot (debug)",
-                                         "embeds":[{"title":f"Watching {symbol} {tf}","description":"No valid impulse/zone yet."}]})
+                                         "embeds":[{"title":f"Watching {symbol} {tf}",
+                                                    "description":"No valid impulse/zone yet."}]})
                         continue
 
                     if LOG_ZONES:
@@ -320,37 +321,32 @@ if __name__ == "__main__":
                         if not sig:
                             continue
 
-                        # Trade plan (for cleanliness calc)
                         plan = compute_trade_plan(cfg, candles, zone, sig)
 
-                        # Scoring
+                        # --- scoring ---
                         score = 0.0; reasons = []
-                        # bias alignment
                         if bias != "neutral":
                             ok = (bias == "bullish" and sig["direction"].startswith("bullish")) or \
                                  (bias == "bearish" and sig["direction"].startswith("bearish"))
                             score += cfg["scoring"]["w_bias"] * (100 if ok else 0)
                             reasons.append(f"bias:{bias}{'✓' if ok else '×'}")
-                        # regime preference
                         reg_ok = (reg == "trending" and sig["type"] == "BOS") or (reg == "ranging" and sig["type"] == "SFP")
                         score += cfg["scoring"]["w_regime"] * (100 if reg_ok else 0)
                         reasons.append(f"reg:{reg}{'✓' if reg_ok else '×'}")
-                        # zone strength proxy
                         zs = getattr(zone, "strength", 1.0)
                         zs_norm = max(min(zs / 5.0, 1.0), 0.0)
                         score += cfg["scoring"]["w_zone_strength"] * (zs_norm * 100)
                         reasons.append(f"zone:{zs_norm:.2f}")
-                        # signal cleanliness
-                        last_close = candles[sig["idx"]].c
                         if sig["type"] == "BOS":
+                            last_close = candles[sig["idx"]].c
                             dist_atr = abs(last_close - sig["level"]) / max(1e-9, plan["atr"])
-                            clean = max(min(dist_atr / 1.0, 1.0), 0.0)  # ~1 ATR beyond = very clean
+                            clean = max(min(dist_atr / 1.0, 1.0), 0.0)
                         else:
-                            clean = 1.0  # SFP already quality-filtered
+                            clean = 1.0
                         score += cfg["scoring"]["w_signal_clean"] * (clean * 100)
                         reasons.append(f"clean:{clean:.2f}")
-
                         final_score = round(score, 1)
+
                         if final_score < cfg["scoring"]["min_score_to_alert"]:
                             if LOG_SCANS:
                                 print(f"[FILTER] {symbol} {tf} {sig['type']} score {final_score} < {cfg['scoring']['min_score_to_alert']}")
