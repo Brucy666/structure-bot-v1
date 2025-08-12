@@ -1,36 +1,75 @@
+# Exchange
 exchange: bybit
+
+# Pairs
 symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 
-# Focused, high-signal TF mix
+# Timeframes (curated for signal quality)
 timeframes: ["1m", "5m", "15m", "1h", "4h"]
 
+# Candles & loop
 lookback_bars: 900
-poll_seconds: 30            # gentler on rate limits
+poll_seconds: 30
 
-discord_webhook_url: ""     # keep empty; Railway env var is used
+# Webhook (keep blank in GitHub; use DISCORD_WEBHOOK_URL on Railway)
+discord_webhook_url: ""
 
+# Impulse detection (base thresholds; may be adapted by regime below)
 impulse:
   atr_len: 14
-  body_min: 0.60            # a touch stricter = cleaner impulses
-  atr_mult: 1.3
+  body_min: 0.60        # stricter for cleaner impulses
+  atr_mult: 1.30
   min_consecutive: 2
 
+# Zone settings
 zones:
-  max_zone_pct: 0.30        # slightly tighter zones
+  max_zone_pct: 0.30    # tighter zones relative to impulse range
 
+# Signal detection
 signals:
   confirm_closes: 1
   sfp_window: 3
 
+# SFP quality (AI touch)
+sfp_quality:
+  min_penetration_pct: 0.03   # wick must pass level by ≥0.03%
+  max_close_inside_pct: 0.02  # close must finish back within 0.02% of level
+
+# Trade plan
 risk:
   retest_offset_pct: 0.03
   stop_atr_mult: 1.2
-  tp_rr: 1.6                # nudge RR up a bit
+  tp_rr: 1.6
 
+# Filters (AI touch)
+filters:
+  use_htf_bias: true
+  htf_timeframe: "1h"
+  session_filter: false
+  sessions_utc: ["07:00-10:59", "13:30-20:59"]  # London open, US cash
+
+# Regime adapt (AI touch)
+regime:
+  lookback: 200
+  atr_ma_len: 50
+  trend_ratio_min: 1.15           # ATR / ATR_MA > 1.15 ⇒ trending
+  adapt_body_min: [0.55, 0.65]    # [ranging, trending]
+  adapt_atr_mult: [1.1, 1.4]      # [ranging, trending]
+
+# Scoring (AI touch)
+scoring:
+  w_bias: 0.30
+  w_regime: 0.20
+  w_zone_strength: 0.25
+  w_signal_clean: 0.25
+  min_score_to_alert: 60
+
+# Deduping
 dedupe_minutes: 30
 
+# Debug (production‑friendly defaults)
 debug:
-  log_scans: true           # keep logs useful in Railway
-  log_zones: false          # quieter
+  log_scans: true
+  log_zones: false
   heartbeat_minutes: 2
-  post_debug_to_discord: false  # ✅ production: no debug posts in channel
+  post_debug_to_discord: false
