@@ -1,48 +1,60 @@
+# Exchange + markets
 exchange: bybit
 symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 
+# Timeframes to scan
 timeframes: ["1m", "5m", "15m", "1h", "4h"]
 
+# Engine cadence
 lookback_bars: 900
 poll_seconds: 30
 
-discord_webhook_url: ""   # use env var
+# If you leave this empty, the bot uses the DISCORD_WEBHOOK_URL env var.
+discord_webhook_url: ""
 
+# Impulse detection
 impulse:
-  atr_len: 14
-  body_min: 0.60
-  atr_mult: 1.30
-  min_consecutive: 2
+  atr_len: 14           # ATR window for "big move" comparison
+  body_min: 0.60        # min body / range ratio to count as impulsive
+  atr_mult: 1.30        # candle range must exceed ATR * this
+  min_consecutive: 2    # require N consecutive impulsive candles
 
+# Zone sizing (wick -> body)
 zones:
-  max_zone_pct: 0.30
+  max_zone_pct: 0.30    # max zone thickness as % of impulse range
 
+# Signal rules
 signals:
-  confirm_closes: 1
-  sfp_window: 3
+  confirm_closes: 1     # closes required beyond the zone (BOS)
+  sfp_window: 3         # look-ahead bars for SFP close back inside
 
+# SFP quality filters
 sfp_quality:
-  min_penetration_pct: 0.02
-  max_close_inside_pct: 0.02
+  min_penetration_pct: 0.02     # wick penetration beyond level
+  max_close_inside_pct: 0.02    # how deep the close returns inside
 
+# Risk model for suggested plan
 risk:
-  retest_offset_pct: 0.03
-  stop_atr_mult: 1.2
-  tp_rr: 1.6
+  retest_offset_pct: 0.03  # entry limit offset from level
+  stop_atr_mult: 1.2       # stop padding using ATR
+  tp_rr: 1.6               # target R multiple
 
+# Filters (higher-timeframe bias, sessions)
 filters:
   use_htf_bias: true
   htf_timeframe: "1h"
   session_filter: false
   sessions_utc: ["07:00-10:59","13:30-20:59"]
 
+# Regime adaptation (trending favors BOS, ranging favors SFP)
 regime:
   lookback: 200
   atr_ma_len: 50
   trend_ratio_min: 1.15
-  adapt_body_min: [0.55, 0.65]
-  adapt_atr_mult: [1.10, 1.40]
+  adapt_body_min: [0.55, 0.65]   # [ranging, trending]
+  adapt_atr_mult: [1.10, 1.40]   # [ranging, trending]
 
+# Scoring & gates (per-TF overrides)
 scoring:
   w_bias: 0.30
   w_regime: 0.20
@@ -56,21 +68,26 @@ scoring:
     "1h": 50
     "4h": 50
 
+# Startup backfill (sends a single “RECENT …” per pair/TF if found)
 startup_backfill:
   enabled: true
   lookback_bars: 1500
   max_signals_per_market: 1
 
+# De-duplicate alerts (same symbol/tf/type/direction/level)
 dedupe_minutes: 30
 
+# Outcome tracking worker settings
 outcomes:
   poll_seconds: 45
   max_age_hours: 24
   miss_after_hours: 6
   tf_for_check: "1m"
+  post_to_discord: true   # <— outcome TP/SL pings to Discord
 
+# Debug / diagnostics
 debug:
   log_scans: true
-  log_zones: false
+  log_zones: true          # <— TEMP: ensure Supabase 'zones' fills; set false later
   heartbeat_minutes: 2
   post_debug_to_discord: false
