@@ -1,277 +1,529 @@
-import os, time, yaml
-from datetime import datetime, timezone
+import os
+import time
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional, Tuple
 
-from structurebot.data_feed import DataFeed
-from structurebot.structure_engine import StructureEngine
-from structurebot.utils import to_candles
-from structurebot.notifier import Notifier
-from structurebot.state import State
-from structurebot.indicators import atr
+import ccxt
+import httpx
+import numpy as np
+import yaml
+
 from structurebot.db import DB
 
-CONFIG_FILE = os.environ.get("STRUCTURE_CONFIG", "config.yml")
 
-def load_cfg():
+CONFIG_FILE = os.environ.get("STRUCTURE_CONFIG", "config.yml")
+WEBHOOK_ENV = os.getenv("DISCORD_WEBHOOK_URL", "")
+
+TF_MS = {
+    "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+    "1h": 3_600_000, "4h": 14_400_000, "12h": 43_200_000, "1d": 86_400_000
+}
+
+
+# ------------------- helpers -------------------
+
+def load_cfg() -> dict:
     with open(CONFIG_FILE, "r") as f:
         return yaml.safe_load(f)
 
-def heartbeat(now_ts, last_ts, minutes: int):
-    return (now_ts - last_ts >= minutes * 60, now_ts if now_ts - last_ts >= minutes * 60 else last_ts)
 
-def in_session_utc(now_ts: float, sessions):
-    from datetime import datetime, timezone
-    t = datetime.fromtimestamp(now_ts, timezone.utc).time()
-    cur = t.hour * 60 + t.minute
-    for window in sessions:
-        a, b = window.split("-")
-        ah, am = map(int, a.split(":")); bh, bm = map(int, b.split(":"))
-        if ah * 60 + am <= cur <= bh * 60 + bm:
-            return True
-    return False
+def tf_ms(tf: str) -> int:
+    return TF_MS.get(tf, 60_000)
 
-def compute_regime(o, h, l, c, cfg):
-    import numpy as np
-    a = atr(o, h, l, c, length=cfg["impulse"]["atr_len"])
-    if len(a) < cfg["regime"]["atr_ma_len"]:
-        return "ranging"
-    ma = np.nanmean(a[-cfg["regime"]["atr_ma_len"]:])
-    ratio = (a[-1] / (ma if ma > 0 else 1e-9))
-    return "trending" if ratio >= cfg["regime"]["trend_ratio_min"] else "ranging"
 
-def compute_bias_htf(feed, symbol, tf, bars=200):
-    try:
-        ohlcv = feed.fetch_ohlcv(symbol, tf, limit=bars)
-        closes = [x[4] for x in ohlcv]; highs = [x[2] for x in ohlcv]; lows = [x[3] for x in ohlcv]
-        swing_hi = max(highs[:-1]) if len(highs) > 1 else highs[-1]
-        swing_lo = min(lows[:-1]) if len(lows) > 1 else lows[-1]
-        if closes[-1] > swing_hi: return "bullish"
-        if closes[-1] < swing_lo: return "bearish"
-        return "neutral"
-    except Exception:
-        return "neutral"
+def to_iso(ts_ms: int) -> str:
+    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat()
 
-def compute_trade_plan(cfg, candles, zone, sig):
-    import numpy as np
-    o = np.array([x.o for x in candles], float); h = np.array([x.h for x in candles], float)
-    l = np.array([x.l for x in candles], float); c = np.array([x.c for x in candles], float)
-    a = atr(o, h, l, c, length=cfg["impulse"]["atr_len"])
-    recent_atr = float(a[-1]) if a[-1] == a[-1] else 0.0
 
-    rpct = cfg["risk"]["retest_offset_pct"] / 100.0
-    stop_mult = cfg["risk"]["stop_atr_mult"]; rr = cfg["risk"]["tp_rr"]
+def atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, length: int = 14) -> float:
+    # True Range
+    prev_close = np.roll(close, 1)
+    prev_close[0] = close[0]
+    tr = np.maximum(high - low, np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
+    # RMA/EMA approx
+    alpha = 1.0 / length
+    rma = 0.0
+    for v in tr[-length * 4:]:  # warmup
+        rma = alpha * v + (1 - alpha) * rma
+    return float(rma)
 
-    if sig["type"] == "BOS":
-        if sig["direction"] == "bullish":
-            side, level = "LONG", zone.top; entry = level * (1 - rpct); stop = level - recent_atr * stop_mult
-        else:
-            side, level = "SHORT", zone.bottom; entry = level * (1 + rpct); stop = level + recent_atr * stop_mult
+
+@dataclass
+class Zone:
+    kind: str           # 'bullish' | 'bearish'
+    top: float
+    bottom: float
+    impulse_end_idx: int
+    strength: float     # 0..1
+
+
+def candle_body_ratio(o: float, c: float, h: float, l: float) -> float:
+    rng = max(h - l, 1e-9)
+    body = abs(c - o)
+    return float(body / rng)
+
+
+def detect_impulse_and_zone(ohlcv: np.ndarray, cfg: dict) -> Optional[Zone]:
+    """
+    Return most recent wick->body zone from the last impulsive candle (or short sequence).
+    """
+    if ohlcv.shape[0] < max(50, cfg["impulse"]["atr_len"] * 4):
+        return None
+
+    o = ohlcv[:, 1]
+    h = ohlcv[:, 2]
+    l = ohlcv[:, 3]
+    c = ohlcv[:, 4]
+
+    atr_len = cfg["impulse"]["atr_len"]
+    min_body = cfg["impulse"]["body_min"]
+    atr_mult = cfg["impulse"]["atr_mult"]
+    min_consec = cfg["impulse"]["min_consecutive"]
+
+    # compute ATR on the fly
+    cur_atr = atr(h, l, c, atr_len)
+
+    # walk from most recent backward to find the last impulsive run
+    run_dir = 0  # +1 up, -1 down
+    run_len = 0
+    end_idx = None
+
+    for i in range(len(ohlcv) - 2, atr_len, -1):
+        bod = candle_body_ratio(o[i], c[i], h[i], l[i])
+        rng = h[i] - l[i]
+        if bod >= min_body and rng >= atr_mult * cur_atr:
+            d = 1 if c[i] > o[i] else -1
+            if run_dir == 0 or d == run_dir:
+                run_dir = d
+                run_len += 1
+                if end_idx is None:
+                    end_idx = i
+            else:
+                break
+            if run_len >= min_consec:
+                # found an impulse ending at end_idx
+                break
+        elif run_len > 0:
+            break
+
+    if end_idx is None or run_len < min_consec:
+        return None
+
+    # Build zone from last impulse candle
+    i = end_idx
+    up = (run_dir == 1)
+
+    if up:
+        # bullish impulse -> bullish zone under candle low -> body low
+        zone_top = float(l[i])
+        body_low = float(min(o[i], c[i]))
+        zone_bottom = float(min(zone_top, body_low))
+        # ensure top >= bottom (top is the "upper" boundary numerically for bullish zones is actually higher price)
+        if zone_bottom > zone_top:
+            zone_top, zone_bottom = zone_bottom, zone_top
+        kind = "bullish"
     else:
-        if "bearish" in sig["direction"]:
-            side, level = "SHORT", zone.top; entry = level * (1 + rpct); stop = level + recent_atr * stop_mult
-        else:
-            side, level = "LONG", zone.bottom; entry = level * (1 - rpct); stop = level - recent_atr * stop_mult
+        # bearish impulse -> bearish zone above candle body high -> high
+        zone_bottom = float(h[i])
+        body_high = float(max(o[i], c[i]))
+        zone_top = float(max(zone_bottom, body_high))
+        if zone_bottom > zone_top:
+            zone_top, zone_bottom = zone_bottom, zone_top
+        kind = "bearish"
 
-    risk = abs(entry - stop) if entry is not None and stop is not None else 0.0
-    tp1 = entry + rr * risk if side == "LONG" else entry - rr * risk
-    return {"side": side, "entry": float(entry), "stop": float(stop), "tp1": float(tp1), "atr": float(recent_atr)}
+    # clamp zone thickness
+    impulse_range = abs(h[i] - l[i])
+    max_pct = cfg["zones"]["max_zone_pct"]
+    max_thick = max_pct * max(impulse_range, 1e-9)
+    thickness = abs(zone_top - zone_bottom)
+    if thickness > max_thick and thickness > 0:
+        mid = (zone_top + zone_bottom) / 2.0
+        zone_top = mid + max_thick / 2.0
+        zone_bottom = mid - max_thick / 2.0
 
-def make_payload(symbol, timeframe, cfg, zone, sig, candles, plan, score, reasons):
-    bar = candles[sig["idx"]]
-    return {
+    # crude "strength" using body ratio & ATR multiple
+    strength = min(1.0, candle_body_ratio(o[i], c[i], h[i], l[i]) * (impulse_range / max(cur_atr, 1e-9)))
+
+    return Zone(kind=kind, top=float(max(zone_top, zone_bottom)), bottom=float(min(zone_top, zone_bottom)),
+                impulse_end_idx=int(i), strength=float(strength))
+
+
+def within(x: float, a: float, b: float) -> bool:
+    lo, hi = min(a, b), max(a, b)
+    return lo - 1e-9 <= x <= hi + 1e-9
+
+
+def check_bos_sfp(ohlcv: np.ndarray, zone: Zone, cfg: dict) -> Optional[Dict]:
+    """
+    Look at most recent bars for:
+      - BOS: close beyond zone (confirm_closes)
+      - SFP: wick through level then close back inside (sfp_window)
+    Returns dict with type/direction/level/idx or None.
+    """
+    confirm = cfg["signals"]["confirm_closes"]
+    sfp_w = cfg["signals"]["sfp_window"]
+
+    # zones are horizontal ranges; use the closer edge as "level" reference
+    if zone.kind == "bullish":
+        level = zone.top  # upper edge for bearish? for bullish zone, the rejection/flip level is top
+        # BOS down = close below bottom
+        closes = [ohlcv[-k, 4] for k in range(1, confirm + 1)]
+        if all(c <= zone.bottom for c in closes):
+            return {"type": "BOS", "direction": "bearish", "level": zone.bottom, "idx": int(len(ohlcv) - 1)}
+        # SFP up through bottom then back inside (wick below, close inside)
+        # check last `sfp_w` bars
+        for k in range(1, min(sfp_w, len(ohlcv) - 1) + 1):
+            lo = ohlcv[-k, 3]; cl = ohlcv[-k, 4]
+            if lo < zone.bottom and within(cl, zone.bottom, zone.top):
+                return {"type": "SFP", "direction": "bullish", "level": zone.bottom, "idx": int(len(ohlcv) - k)}
+    else:
+        level = zone.bottom
+        # BOS up = close above top
+        closes = [ohlcv[-k, 4] for k in range(1, confirm + 1)]
+        if all(c >= zone.top for c in closes):
+            return {"type": "BOS", "direction": "bullish", "level": zone.top, "idx": int(len(ohlcv) - 1)}
+        # SFP down through top then back inside
+        for k in range(1, min(sfp_w, len(ohlcv) - 1) + 1):
+            hi = ohlcv[-k, 2]; cl = ohlcv[-k, 4]
+            if hi > zone.top and within(cl, zone.bottom, zone.top):
+                return {"type": "SFP", "direction": "bearish", "level": zone.top, "idx": int(len(ohlcv) - k)}
+
+    return None
+
+
+def build_plan(ohlcv: np.ndarray, zone: Zone, sig: Dict, cfg: dict) -> Dict:
+    """
+    Entry: retest of zone edge (slight offset)
+    Stop: beyond opposite edge using ATR pad
+    TP1: fixed R multiple
+    """
+    # ATR of recent data
+    h = ohlcv[:, 2]; l = ohlcv[:, 3]; c = ohlcv[:, 4]
+    cur_atr = atr(h, l, c, cfg["impulse"]["atr_len"])
+
+    off = cfg["risk"]["retest_offset_pct"]
+    pad_mult = cfg["risk"]["stop_atr_mult"]
+    rr = cfg["risk"]["tp_rr"]
+
+    if sig["direction"] == "bullish":
+        entry = float(zone.bottom + off * (zone.top - zone.bottom))
+        stop = float(zone.bottom - pad_mult * cur_atr)
+        tp1 = entry + rr * (entry - stop)
+    else:
+        entry = float(zone.top - off * (zone.top - zone.bottom))
+        stop = float(zone.top + pad_mult * cur_atr)
+        tp1 = entry - rr * (stop - entry)
+
+    return {"entry": entry, "stop": stop, "tp1": tp1, "atr": float(cur_atr)}
+
+
+def score_signal(zone: Zone, sig: Dict, plan: Dict, cfg: dict, regime_tag: str, htf_bias: Optional[str]) -> Tuple[float, List[str]]:
+    reasons = []
+    score = 0.0
+
+    # zone strength
+    zs = min(1.0, max(0.0, zone.strength))
+    zs_w = cfg["scoring"]["w_zone_strength"]
+    score += 100 * zs * zs_w
+    reasons.append(f"zone:{zs:.2f}")
+
+    # cleanliness: distance from level vs ATR
+    dist = abs(plan["entry"] - sig["level"])
+    clean = max(0.0, 1.0 - dist / max(plan["atr"], 1e-9))
+    cl_w = cfg["scoring"]["w_signal_clean"]
+    score += 100 * clean * cl_w
+    reasons.append(f"clean:{clean:.2f}")
+
+    # regime
+    rg_w = cfg["scoring"]["w_regime"]
+    if regime_tag == "trending" and sig["type"] == "BOS":
+        score += 100 * 1.0 * rg_w; reasons.append("reg:trending✓")
+    elif regime_tag == "ranging" and sig["type"] == "SFP":
+        score += 100 * 1.0 * rg_w; reasons.append("reg:ranging✓")
+    else:
+        reasons.append(f"reg:{regime_tag}×")
+
+    # HTF bias
+    bias_w = cfg["scoring"]["w_bias"]
+    if cfg["filters"]["use_htf_bias"] and htf_bias:
+        ok = (htf_bias == sig["direction"])
+        score += 100 * (1.0 if ok else 0.0) * bias_w
+        reasons.append(f"bias:{htf_bias}{'✓' if ok else '×'}")
+
+    return score, reasons
+
+
+def dedupe_key(symbol: str, tf: str, sig: Dict) -> str:
+    return f"{symbol}:{tf}:{sig['type']}:{sig['direction']}:{round(float(sig['level']), 2)}"
+
+
+def post_discord(webhook: str, title: str, fields: List[Dict], footer: str, color: int = 0x5865F2):
+    if not webhook:
+        return
+    payload = {
         "username": "StructureBot",
         "embeds": [{
-            "title": f"{sig['type']} — {symbol} {timeframe} ({plan['side']})",
-            "description": f"Zone: **{zone.kind}** | Level: **{sig['level']:.2f}**\n"
-                           f"Direction: **{sig['direction']}**\n"
-                           f"Close: **{bar.c:.2f}** | Time (ms): **{bar.ts}**",
-            "fields": [
-                {"name": "Entry (limit)", "value": f"{plan['entry']:.2f}", "inline": True},
-                {"name": "Stop", "value": f"{plan['stop']:.2f}", "inline": True},
-                {"name": f"TP1 (~{cfg['risk']['tp_rr']}R)", "value": f"{plan['tp1']:.2f}", "inline": True},
-                {"name": "Zone Top / Bottom", "value": f"{zone.top:.2f} / {zone.bottom:.2f}", "inline": True},
-                {"name": "ATR", "value": f"{plan['atr']:.2f}", "inline": True},
-                {"name": "Score", "value": f"{score:.1f} / 100", "inline": True},
-            ],
-            "footer": {"text": "BOS/SFP from last impulse wick→body zone • " + ", ".join(reasons)}
+            "title": title,
+            "color": color,
+            "fields": fields,
+            "footer": {"text": footer}
         }]
     }
+    try:
+        with httpx.Client(timeout=15) as cli:
+            cli.post(webhook, json=payload)
+    except Exception as e:
+        print(f"[DISCORD] post error: {e}")
 
-def find_recent_signal(engine, candles, zone, cfg):
-    if not zone or not candles: return None
-    closes = [x.c for x in candles]; highs = [x.h for x in candles]; lows = [x.l for x in candles]
-    last_bos = None
-    if zone.kind == "bearish":
-        for i in range(zone.impulse_end_idx + 1, len(candles)):
-            if closes[i] > zone.top: last_bos = {"type":"BOS","direction":"bullish","level":zone.top,"idx":i}
-    else:
-        for i in range(zone.impulse_end_idx + 1, len(candles)):
-            if closes[i] < zone.bottom: last_bos = {"type":"BOS","direction":"bearish","level":zone.bottom,"idx":i}
-    last_sfp = None
-    w = cfg["signals"]["sfp_window"]; min_pen = cfg["sfp_quality"]["min_penetration_pct"]; max_inside = cfg["sfp_quality"]["max_close_inside_pct"]
-    if zone.kind == "bearish":
-        for i in range(zone.impulse_end_idx + 1, len(candles)):
-            if highs[i] > zone.top and closes[i] <= zone.top:
-                pen = (highs[i] - zone.top) / zone.top; inside = abs(closes[i] - zone.top) / zone.top
-                if pen >= min_pen and inside <= max_inside: last_sfp = {'type':'SFP','direction':'bearish-failed-break','level':zone.top,'idx':i}
-            for j in range(i+1, min(i+1+w, len(candles))):
-                if highs[i] > zone.top and closes[j] <= zone.top:
-                    pen = (highs[i] - zone.top) / zone.top; inside = abs(closes[j] - zone.top) / zone.top
-                    if pen >= min_pen and inside <= max_inside: last_sfp = {'type':'SFP','direction':'bearish-failed-break','level':zone.top,'idx':j}
-    else:
-        for i in range(zone.impulse_end_idx + 1, len(candles)):
-            if lows[i] < zone.bottom and closes[i] >= zone.bottom:
-                pen = (zone.bottom - lows[i]) / zone.bottom; inside = abs(closes[i] - zone.bottom) / zone.bottom
-                if pen >= min_pen and inside <= max_inside: last_sfp = {'type':'SFP','direction':'bullish-failed-break','level':zone.bottom,'idx':i}
-            for j in range(i+1, min(i+1+w, len(candles))):
-                if lows[i] < zone.bottom and closes[j] >= zone.bottom:
-                    pen = (zone.bottom - lows[i]) / zone.bottom; inside = abs(closes[j] - zone.bottom) / zone.bottom
-                    if pen >= min_pen and inside <= max_inside: last_sfp = {'type':'SFP','direction':'bullish-failed-break','level':zone.bottom,'idx':j}
-    if last_bos and last_sfp:
-        return last_bos if last_bos["idx"] > last_sfp["idx"] else last_sfp
-    return last_bos or last_sfp
+
+# ---- zone persist helper (full-args, dict or object) ----
+def save_zone(db: DB, symbol: str, tf: str, zone):
+    """
+    Persist a zone to Supabase with full details required by DB.upsert_zone().
+    Works if `zone` is an object (attrs) or a dict. Safely skips if fields missing.
+    """
+    if zone is None:
+        return
+
+    def zget(attr, default=None):
+        if isinstance(zone, dict):
+            return zone.get(attr, default)
+        return getattr(zone, attr, default)
+
+    kind   = zget("kind")
+    top    = zget("top")
+    bottom = zget("bottom")
+    i_end  = zget("impulse_end_idx", zget("impulse_end", zget("end_idx")))
+    streng = zget("strength", zget("score", 0.0))
+
+    if kind is None or top is None or bottom is None:
+        print(f"[ZONE] skip persist (missing fields) {symbol} {tf} kind={kind} top={top} bottom={bottom}")
+        return
+
+    try:
+        db.upsert_zone(symbol, tf, kind, float(top), float(bottom),
+                       int(i_end) if i_end is not None else 0,
+                       float(streng) if streng is not None else 0.0)
+    except Exception as e:
+        print(f"[ZONE] persist error {symbol} {tf}: {e}")
+
+
+def regime_tag_from_vol(ohlcv: np.ndarray, cfg: dict) -> str:
+    # simple regime: compare recent avg range to longer ATR
+    h = ohlcv[:, 2]; l = ohlcv[:, 3]; c = ohlcv[:, 4]
+    long_atr = atr(h, l, c, cfg["regime"]["atr_ma_len"])
+    rng = np.mean(h[-50:] - l[-50:])
+    return "trending" if (rng / max(long_atr, 1e-9)) >= cfg["regime"]["trend_ratio_min"] else "ranging"
+
+
+def htf_bias_simple(ohlcv_htf: np.ndarray) -> Optional[str]:
+    if ohlcv_htf.shape[0] < 2:
+        return None
+    # last 20 close vs simple MA as bias proxy
+    closes = ohlcv_htf[:, 4]
+    ma = np.mean(closes[-20:])
+    return "bullish" if closes[-1] >= ma else "bearish"
+
+
+def load_overrides(db: DB) -> Dict[Tuple[str, str], int]:
+    try:
+        if not db.enabled:
+            return {}
+        res = db.client.table("score_overrides").select("*").execute()
+        rows = res.data or []
+        return {(r["symbol"], r["timeframe"]): int(r["min_score_to_alert"]) for r in rows}
+    except Exception as e:
+        # table may not exist; that's fine
+        if "score_overrides" not in str(e):
+            print(f"[OVERRIDES] load err: {e}")
+        return {}
+
+
+# ------------------- main -------------------
 
 if __name__ == "__main__":
     cfg = load_cfg()
-    feed = DataFeed(cfg["exchange"])
-    eng  = StructureEngine(cfg)
-    notify = Notifier(os.environ.get("DISCORD_WEBHOOK_URL") or cfg.get("discord_webhook_url",""))
-    state  = State()
-    db     = DB()
+    webhook = cfg.get("discord_webhook_url") or WEBHOOK_ENV
 
-    dbg = cfg.get("debug", {})
-    LOG_SCANS  = bool(dbg.get("log_scans", True))
-    LOG_ZONES  = bool(dbg.get("log_zones", False))
-    HEART_MIN  = int(dbg.get("heartbeat_minutes", 2))
+    ex = ccxt.bybit({"enableRateLimit": True})
+    db = DB()
 
-    supported_tfs = set((feed.exchange.timeframes or {}).keys())
-    valid_tfs = [tf for tf in cfg["timeframes"] if not supported_tfs or tf in supported_tfs] or cfg["timeframes"]
-    print(f"[INFO] Using timeframes: {valid_tfs}")
+    symbols: List[str] = cfg["symbols"]
+    tfs: List[str] = cfg["timeframes"]
+    lb = int(cfg["lookback_bars"])
+    poll = int(cfg["poll_seconds"])
 
-    markets = feed.exchange.load_markets()
-    def resolve_symbol(sym: str):
-        if sym in markets: return sym
-        if sym.endswith("/USDT") and sym + ":USDT" in markets: return sym + ":USDT"
-        if sym.endswith(":USDT") and sym.replace(":USDT","") in markets: return sym.replace(":USDT","")
-        print(f"[SYMBOL] UNSUPPORTED on {cfg['exchange']}: {sym}"); return None
-    symbols = [s for s in (resolve_symbol(s) for s in cfg["symbols"]) if s]
+    # de-dupe memory
+    seen = deque(maxlen=2048)
+    dedupe_minutes = int(cfg.get("dedupe_minutes", 30))
+
+    # overrides
+    overrides = load_overrides(db)
+    last_ovr = time.time()
+
+    # startup backfill
+    if cfg.get("startup_backfill", {}).get("enabled", True):
+        bf_bars = int(cfg["startup_backfill"]["lookback_bars"])
+        max_per = int(cfg["startup_backfill"]["max_signals_per_market"])
+        print(f"[BACKFILL] Starting (bars={bf_bars}, max_per_market={max_per})")
+
+        for sym in symbols:
+            for tf in tfs:
+                try:
+                    ohlcv = ex.fetch_ohlcv(sym, tf, limit=min(1500, bf_bars))
+                except Exception as e:
+                    print(f"[BACKFILL_ERR] {sym} {tf}: {e}")
+                    continue
+                if not ohlcv:
+                    continue
+                arr = np.array(ohlcv, dtype=float)
+
+                zone = detect_impulse_and_zone(arr, cfg)
+                if zone:
+                    if cfg["debug"].get("log_zones", False):
+                        save_zone(db, sym, tf, zone)
+
+                    sig = check_bos_sfp(arr, zone, cfg)
+                    if sig:
+                        plan = build_plan(arr, zone, sig, cfg)
+                        regime = regime_tag_from_vol(arr, cfg)
+                        # HTF bias if enabled
+                        bias = None
+                        if cfg["filters"]["use_htf_bias"]:
+                            htf_tf = cfg["filters"]["htf_timeframe"]
+                            try:
+                                htf = ex.fetch_ohlcv(sym, htf_tf, limit=200)
+                                bias = htf_bias_simple(np.array(htf, dtype=float))
+                            except Exception:
+                                bias = None
+                        score, reasons = score_signal(zone, sig, plan, cfg, regime, bias)
+                        gate_tf = cfg["scoring"]["tf_overrides"].get(tf, cfg["scoring"]["min_score_to_alert"])
+                        gate = overrides.get((sym, tf), gate_tf)
+                        if score >= gate:
+                            key = dedupe_key(sym, tf, sig)
+                            if not any(k==key and (datetime.now(timezone.utc)-t).total_seconds()<dedupe_minutes*60 for k,t in seen):
+                                seen.append((key, datetime.now(timezone.utc)))
+                                title = f"RECENT {sig['type']} — {sym} {tf} ({sig['direction'].upper()})"
+                                fields = [
+                                    {"name":"Zone","value": f"{zone.kind} | Level: {sig['level']:.2f}", "inline":False},
+                                    {"name":"Entry (limit)","value": f"{plan['entry']:.2f}", "inline":True},
+                                    {"name":"Stop","value": f"{plan['stop']:.2f}", "inline":True},
+                                    {"name":"TP1 (~{cfg['risk']['tp_rr']}R)","value": f"{plan['tp1']:.2f}", "inline":True},
+                                    {"name":"Zone Top / Bottom","value": f"{zone.top:.2f} / {zone.bottom:.2f}", "inline":True},
+                                    {"name":"ATR","value": f"{plan['atr']:.2f}", "inline":True},
+                                    {"name":"Score","value": f"{score:.1f} / 100", "inline":True},
+                                ]
+                                post_discord(webhook, title, fields,
+                                             footer="BOS/SFP from last impulse wick→body zone • startup-backfill")
+                                # DB
+                                db.log_signal(sym, tf, sig, zone, plan, score, reasons, True, key)
+
+    print(f"[INFO] Using timeframes: {tfs}")
     print(f"[INFO] Using symbols: {symbols}")
 
-    # -------- startup backfill (real impulses) + dedupe ----------
-    if cfg.get("startup_backfill", {}).get("enabled", False):
-        bf_limit = int(cfg["startup_backfill"]["max_signals_per_market"])
-        bf_bars  = int(cfg["startup_backfill"]["lookback_bars"])
-        print(f"[BACKFILL] Starting (bars={bf_bars}, max_per_market={bf_limit})")
-        for sym in symbols:
-            for tf in valid_tfs:
-                posted = 0
-                try:
-                    candles = to_candles(feed.fetch_ohlcv(sym, tf, limit=bf_bars))
-                    if len(candles) < 50: 
-                        print(f"[BACKFILL] {sym} {tf} — not enough candles"); 
-                        continue
-                    impulse = eng.detect_last_impulse(candles)
-                    zone = eng.make_zone_from_impulse(candles, impulse)
-                    if not zone: 
-                        print(f"[BACKFILL] {sym} {tf} — no zone"); 
-                        continue
-                    if LOG_ZONES: db.upsert_zone(sym, tf, zone)
-                    sig = find_recent_signal(eng, candles, zone, cfg)
-                    if not sig:
-                        print(f"[BACKFILL] {sym} {tf} — no recent BOS/SFP"); 
-                        continue
-                    plan = compute_trade_plan(cfg, candles, zone, sig)
-                    payload = make_payload(sym, tf, cfg, zone, sig, candles, plan, 99.0, ["startup-backfill"])
-                    payload["embeds"][0]["title"] = "RECENT " + payload["embeds"][0]["title"]
-                    key = f"{sym}:{tf}:{sig['type']}:{sig['direction']}:{round(sig['level'],2)}"
-                    if not state.can_alert(key, cfg["dedupe_minutes"]):
-                        print(f"[BACKFILL] deduped {sym} {tf}")
-                    else:
-                        notify.post(payload)
-                        db.log_signal(sym, tf, sig, zone, plan, 99.0, ["startup-backfill"], True, key)
-                        print(f"[BACKFILL] Posted RECENT {sym} {tf}")
-                        posted += 1
-                        if posted >= bf_limit: continue
-                except Exception as e:
-                    print(f"[BACKFILL ERR] {sym} {tf}: {e}")
-        print("[BACKFILL] Done")
+    last_hb = datetime.now(timezone.utc)
+    HEART_MIN = int(cfg["debug"].get("heartbeat_minutes", 2))
 
-    last_hb = 0
+    # main scan loop
     while True:
         for sym in symbols:
-            for tf in valid_tfs:
+            for tf in tfs:
+                print(f"[SCAN] {sym} {tf} …")
                 try:
-                    if LOG_SCANS: print(f"[SCAN] {sym} {tf} …")
-                    candles = to_candles(feed.fetch_ohlcv(sym, tf, limit=cfg["lookback_bars"]))
-                    if len(candles) < 20: 
-                        if LOG_SCANS: print(f"[SKIP] {sym} {tf} — not enough candles"); 
-                        continue
-                    if cfg["filters"]["session_filter"] and not in_session_utc(time.time(), cfg["filters"]["sessions_utc"]):
-                        if LOG_SCANS: print(f"[SKIP] {sym} {tf} — out of session"); 
-                        continue
-
-                    import numpy as np
-                    o = np.array([x.o for x in candles], float); h = np.array([x.h for x in candles], float)
-                    l = np.array([x.l for x in candles], float); c = np.array([x.c for x in candles], float)
-                    reg = compute_regime(o, h, l, c, cfg)
-                    if reg == "trending":
-                        eng.cfg["impulse"]["body_min"] = cfg["regime"]["adapt_body_min"][1]; eng.cfg["impulse"]["atr_mult"] = cfg["regime"]["adapt_atr_mult"][1]
-                    else:
-                        eng.cfg["impulse"]["body_min"] = cfg["regime"]["adapt_body_min"][0]; eng.cfg["impulse"]["atr_mult"] = cfg["regime"]["adapt_atr_mult"][0]
-
-                    bias = "neutral"
-                    if cfg["filters"]["use_htf_bias"]:
-                        bias = compute_bias_htf(feed, sym, cfg["filters"]["htf_timeframe"])
-
-                    impulse = eng.detect_last_impulse(candles)
-                    zone = eng.make_zone_from_impulse(candles, impulse)
-                    if not zone: 
-                        if LOG_SCANS: print(f"[WAIT] {sym} {tf} — no valid impulse/zone yet"); 
-                        continue
-
-                    if cfg["debug"]["log_zones"]: db.upsert_zone(sym, tf, zone)
-
-                    bos = eng.bos_signal(candles, zone)
-                    sfp = eng.sfp_signal(candles, zone)
-
-                    for sig in (bos, sfp):
-                        if not sig: continue
-                        plan = compute_trade_plan(cfg, candles, zone, sig)
-
-                        score = 0.0; reasons = []
-                        if bias != "neutral":
-                            ok = (bias == "bullish" and sig["direction"].startswith("bullish")) or (bias == "bearish" and sig["direction"].startswith("bearish"))
-                            score += cfg["scoring"]["w_bias"] * (100 if ok else 0); reasons.append(f"bias:{bias}{'✓' if ok else '×'}")
-                        reg_ok = (reg == "trending" and sig["type"] == "BOS") or (reg == "ranging" and sig["type"] == "SFP")
-                        score += cfg["scoring"]["w_regime"] * (100 if reg_ok else 0); reasons.append(f"reg:{reg}{'✓' if reg_ok else '×'}")
-                        zs_norm = max(min(getattr(zone, "strength", 1.0) / 5.0, 1.0), 0.0)
-                        score += cfg["scoring"]["w_zone_strength"] * (zs_norm * 100); reasons.append(f"zone:{zs_norm:.2f}")
-                        if sig["type"] == "BOS":
-                            last_close = candles[sig["idx"]].c; clean = max(min(abs(last_close - sig["level"]) / max(1e-9, plan["atr"]), 1.0), 0.0)
-                        else:
-                            clean = 1.0
-                        score += cfg["scoring"]["w_signal_clean"] * (clean * 100); reasons.append(f"clean:{clean:.2f}")
-                        final_score = round(score, 1)
-
-                        gate = cfg["scoring"]["tf_overrides"].get(tf, cfg["scoring"]["min_score_to_alert"])
-                        if final_score < gate:
-                            if LOG_SCANS: print(f"[FILTER] {sym} {tf} {sig['type']} score {final_score} < {gate}")
-                            continue
-
-                        key = f"{sym}:{tf}:{sig['type']}:{sig['direction']}:{round(sig['level'],2)}"
-                        if not state.can_alert(key, cfg["dedupe_minutes"]):
-                            if LOG_SCANS: print(f"[DEDUPE] {key} — throttled")
-                            continue
-
-                        payload = make_payload(sym, tf, cfg, zone, sig, candles, plan, final_score, reasons)
-                        Notifier(os.environ.get("DISCORD_WEBHOOK_URL") or cfg.get("discord_webhook_url","")).post(payload)
-                        db.log_signal(sym, tf, sig, zone, plan, final_score, reasons, False, key)
-                        print(f"[ALERT] {sym} {tf} — {sig['type']} {sig['direction']} → {plan['side']} | score {final_score}")
-
+                    ohlcv = ex.fetch_ohlcv(sym, tf, limit=min(lb, 1500))
                 except Exception as e:
-                    print(f"[ERR] {sym} {tf} ({cfg['exchange']}): {e}")
+                    print(f"[ERR] {sym} {tf}: {e}")
+                    continue
+                if not ohlcv or len(ohlcv) < 50:
+                    print(f"[WAIT] {sym} {tf} — insufficient data")
+                    continue
 
-        now = time.time()
-        ping, last_hb = heartbeat(now, last_hb, cfg["debug"]["heartbeat_minutes"])
-        if ping:
-            print(f"[HEARTBEAT] {datetime.now(timezone.utc).isoformat()} — OK, sleeping {cfg['poll_seconds']}s")
-        time.sleep(cfg["poll_seconds"])
+                arr = np.array(ohlcv, dtype=float)
+                zone = detect_impulse_and_zone(arr, cfg)
+                if not zone:
+                    print(f"[WAIT] {sym} {tf} — no valid impulse/zone yet")
+                    continue
+
+                # persist zone snapshot if requested
+                if cfg["debug"].get("log_zones", False):
+                    save_zone(db, sym, tf, zone)
+
+                sig = check_bos_sfp(arr, zone, cfg)
+                if not sig:
+                    continue
+
+                # build plan & score
+                plan = build_plan(arr, zone, sig, cfg)
+                regime = regime_tag_from_vol(arr, cfg)
+
+                bias = None
+                if cfg["filters"]["use_htf_bias"]:
+                    htf_tf = cfg["filters"]["htf_timeframe"]
+                    try:
+                        htf = ex.fetch_ohlcv(sym, htf_tf, limit=200)
+                        bias = htf_bias_simple(np.array(htf, dtype=float))
+                    except Exception:
+                        bias = None
+
+                score, reasons = score_signal(zone, sig, plan, cfg, regime, bias)
+
+                # gate (per-TF with optional live overrides)
+                gate_tf = cfg["scoring"]["tf_overrides"].get(tf, cfg["scoring"]["min_score_to_alert"])
+                gate = overrides.get((sym, tf), gate_tf)
+                reasons_str = f"reg:{regime} • zone:{zone.strength:.2f} • clean:{abs(plan['entry']-sig['level'])/max(plan['atr'],1e-9):.2f}"
+
+                if score < gate:
+                    if cfg["debug"].get("log_scans", False):
+                        print(f"[FILTER] {sym} {tf} {sig['type']} {sig['direction']} score {score:.1f} < gate {gate}")
+                    continue
+
+                # dedupe
+                key = dedupe_key(sym, tf, sig)
+                now = datetime.now(timezone.utc)
+                # prune seen older than dedupe window
+                # (store as list of tuples to avoid memory leaks)
+                new_seen = deque(maxlen=2048)
+                while seen:
+                    k, t = seen.popleft()
+                    if (now - t).total_seconds() < dedupe_minutes * 60:
+                        new_seen.append((k, t))
+                seen = new_seen
+                if any(k == key for k, _ in seen):
+                    if cfg["debug"].get("log_scans", False):
+                        print(f"[DEDUPE] skip {key}")
+                    continue
+                seen.append((key, now))
+
+                # alert
+                title = f"{sig['type']} — {sym} {tf} ({sig['direction'].upper()})"
+                fields = [
+                    {"name":"Zone","value": f"{zone.kind} | Level: {sig['level']:.2f}", "inline":False},
+                    {"name":"Close","value": f"{arr[-1,4]:.2f} | Time (ms): {int(arr[-1,0])}", "inline":False},
+                    {"name":"Entry (limit)","value": f"{plan['entry']:.2f}", "inline":True},
+                    {"name":"Stop","value": f"{plan['stop']:.2f}", "inline":True},
+                    {"name":"TP1 (~{cfg['risk']['tp_rr']}R)","value": f"{plan['tp1']:.2f}", "inline":True},
+                    {"name":"Zone Top / Bottom","value": f"{zone.top:.2f} / {zone.bottom:.2f}", "inline":True},
+                    {"name":"ATR","value": f"{plan['atr']:.2f}", "inline":True},
+                    {"name":"Score","value": f"{score:.1f} / 100", "inline":True},
+                ]
+                post_discord(webhook, title, fields,
+                             footer=f"BOS/SFP from last impulse wick→body zone • {reasons_str}",
+                             color=0x2ecc71 if sig["direction"] == "bullish" else 0xe74c3c)
+
+                # DB insert
+                db.log_signal(sym, tf, sig, zone, plan, score, reasons, False, key)
+
+        # reload overrides occasionally
+        if time.time() - last_ovr > 600:
+            overrides = load_overrides(db)
+            last_ovr = time.time()
+            print(f"[OVERRIDES] reloaded {len(overrides)} rows")
+
+        # heartbeat
+        if (datetime.now(timezone.utc) - last_hb).total_seconds() >= HEART_MIN * 60:
+            print(f"[HEARTBEAT] {datetime.now(timezone.utc).isoformat()} — cycle OK, sleeping {poll}s")
+            last_hb = datetime.now(timezone.utc)
+
+        time.sleep(poll)
