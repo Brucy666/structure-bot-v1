@@ -1,93 +1,107 @@
-# Exchange + markets
-exchange: bybit
-symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+# =============================
+# StructureBot Config
+# =============================
 
-# Timeframes to scan
-timeframes: ["1m", "5m", "15m", "1h", "4h"]
+symbols:
+  - "BTC/USDT"
+  - "ETH/USDT"
+  - "SOL/USDT"
 
-# Engine cadence
-lookback_bars: 900
+timeframes:
+  - "1m"
+  - "5m"
+
+lookback_bars: 500
 poll_seconds: 30
 
-# If you leave this empty, the bot uses the DISCORD_WEBHOOK_URL env var.
-discord_webhook_url: ""
-
-# Impulse detection
-impulse:
-  atr_len: 14           # ATR window for "big move" comparison
-  body_min: 0.60        # min body / range ratio to count as impulsive
-  atr_mult: 1.30        # candle range must exceed ATR * this
-  min_consecutive: 2    # require N consecutive impulsive candles
-
-# Zone sizing (wick -> body)
-zones:
-  max_zone_pct: 0.30    # max zone thickness as % of impulse range
-
-# Signal rules
-signals:
-  confirm_closes: 1     # closes required beyond the zone (BOS)
-  sfp_window: 3         # look-ahead bars for SFP close back inside
-
-# SFP quality filters
-sfp_quality:
-  min_penetration_pct: 0.02     # wick penetration beyond level
-  max_close_inside_pct: 0.02    # how deep the close returns inside
-
-# Risk model for suggested plan
+# =============================
+# Risk / trade plan
+# =============================
 risk:
-  retest_offset_pct: 0.03  # entry limit offset from level
-  stop_atr_mult: 1.2       # stop padding using ATR
-  tp_rr: 1.6               # target R multiple
+  retest_offset_pct: 0.1     # entry offset into zone
+  stop_atr_mult: 0.8         # stop size relative to ATR
+  tp_rr: 1.6                 # TP1 RR multiple
 
-# Filters (higher-timeframe bias, sessions)
+# =============================
+# Signal detection
+# =============================
+impulse:
+  atr_len: 14
+  body_min: 0.5
+  atr_mult: 1.0
+  min_consecutive: 1
+
+zones:
+  max_zone_pct: 0.5          # max % of impulse size for zone thickness
+
+signals:
+  confirm_closes: 1          # closes needed beyond zone for BOS
+  sfp_window: 3              # lookback bars for SFP
+
+# =============================
+# Scoring system
+# =============================
+scoring:
+  min_score_to_alert: 70
+  tf_overrides:
+    "1m": 70
+    "5m": 75
+  w_zone_strength: 0.4
+  w_signal_clean: 0.3
+  w_regime: 0.2
+  w_bias: 0.1
+
+# =============================
+# Filters
+# =============================
 filters:
   use_htf_bias: true
-  htf_timeframe: "1h"
-  session_filter: false
-  sessions_utc: ["07:00-10:59","13:30-20:59"]
+  htf_timeframe: "15m"
 
-# Regime adaptation (trending favors BOS, ranging favors SFP)
+# =============================
+# Regime detection
+# =============================
 regime:
-  lookback: 200
   atr_ma_len: 50
-  trend_ratio_min: 1.15
-  adapt_body_min: [0.55, 0.65]   # [ranging, trending]
-  adapt_atr_mult: [1.10, 1.40]   # [ranging, trending]
+  trend_ratio_min: 1.5
 
-# Scoring & gates (per-TF overrides)
-scoring:
-  w_bias: 0.30
-  w_regime: 0.20
-  w_zone_strength: 0.25
-  w_signal_clean: 0.25
-  min_score_to_alert: 55
-  tf_overrides:
-    "1m": 60
-    "5m": 55
-    "15m": 55
-    "1h": 50
-    "4h": 50
-
-# Startup backfill (sends a single “RECENT …” per pair/TF if found)
+# =============================
+# Startup backfill
+# =============================
 startup_backfill:
   enabled: true
-  lookback_bars: 1500
-  max_signals_per_market: 1
+  lookback_bars: 200
+  max_signals_per_market: 5
 
-# De-duplicate alerts (same symbol/tf/type/direction/level)
-dedupe_minutes: 30
-
-# Outcome tracking worker settings
-outcomes:
-  poll_seconds: 45
-  max_age_hours: 24
-  miss_after_hours: 6
-  tf_for_check: "1m"
-  post_to_discord: true   # <— outcome TP/SL pings to Discord
-
-# Debug / diagnostics
+# =============================
+# Debug / logging
+# =============================
 debug:
   log_scans: true
-  log_zones: true          # <— TEMP: ensure Supabase 'zones' fills; set false later
+  log_zones: true
   heartbeat_minutes: 2
-  post_debug_to_discord: false
+
+# =============================
+# Supabase
+# =============================
+supabase:
+  signals_table: "signals"
+
+# =============================
+# Discord
+# =============================
+discord_webhook_url: ${DISCORD_WEBHOOK_URL}
+
+# =============================
+# Research mode
+# =============================
+research:
+  exchange: binance
+  symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+  timeframes: ["1m"]
+  days: 30
+  min_score: 70
+  cache_dir: "cache"
+  push_to_supabase: true
+  save_csv: true
+  signals_table: "signals"
