@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Research Mode backtester for StructureBot
-- Fetches historical OHLCV (via CCXT; default binance)
-- Replays BOS/SFP logic bar-by-bar
-- Simulates entries/exits (limit at zone edge, SL/TP1)
-- Writes results to Supabase (table: signals) with is_backtest=true
-- Also saves CSVs under /backtests
+StructureBot — Research Mode Backtester (cleaned)
+- Fetches historical OHLCV via CCXT (default: binance futures if available)
+- Replays BOS & SFP logic bar-by-bar
+- Simulates limit entry at zone edge, SL priority, TP1 (~1.6R)
+- Upserts results to Supabase (table configurable), tagged is_backtest=true
+- Saves CSVs under /backtests/
 
-Requirements (add to requirements.txt if missing):
+Reqs (ensure in requirements.txt):
   ccxt>=4.3.0
   pandas>=2.2.0
   numpy>=1.26.0
@@ -31,65 +31,54 @@ import requests
 import pandas as pd
 import numpy as np
 
-# ----- optional import; raise a friendly error if missing
+# ---- optional import guard
 try:
     import ccxt
-except Exception as e:
+except Exception:
     ccxt = None
 
 
-# ==============================
-# Utilities
-# ==============================
+# =============== small utils ===============
 def utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
-
 
 def to_ms(t: dt.datetime) -> int:
     if t.tzinfo is None:
         t = t.replace(tzinfo=dt.timezone.utc)
     return int(t.timestamp() * 1000)
 
-
 def ensure_dir(path: str) -> None:
     pathlib.Path(path).mkdir(parents=True, exist_ok=True)
 
-
 def parse_yaml_maybe(s: str):
-    """Try to parse a YAML string; on failure return s."""
     try:
         return yaml.safe_load(s)
     except Exception:
         return s
 
-
 def load_cfg() -> dict:
-    """
-    Load config from STRUCTURE_CONFIG (YAML string) if present,
-    otherwise from config.yml. Always return a dict.
-    """
     raw = os.environ.get("STRUCTURE_CONFIG")
     if raw:
         cfg = parse_yaml_maybe(raw)
         if isinstance(cfg, dict):
             return cfg
-        # Allow case where env var is a path to a file
         if isinstance(cfg, str) and pathlib.Path(cfg).exists():
-            with open(cfg, "r") as f:
-                return yaml.safe_load(f)
-        # As a last resort, treat it as empty dict
+            with open(raw, "r") as f:
+                return yaml.safe_load(f) or {}
         return {}
-    # Fallback to file
     if pathlib.Path("config.yml").exists():
         with open("config.yml", "r") as f:
-            data = yaml.safe_load(f)
-            return data if isinstance(data, dict) else {}
+            return yaml.safe_load(f) or {}
     return {}
 
+def env_flag(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return str(v).lower() in ("1", "true", "yes", "y", "on")
 
-# ==============================
-# Supabase lightweight client
-# ==============================
+
+# =============== Supabase lite client ===============
 class Supa:
     def __init__(self, url: str, service_key: str, table: str):
         self.url = url.rstrip("/")
@@ -103,44 +92,30 @@ class Supa:
             "Prefer": "resolution=merge-duplicates"
         })
 
-    def insert_signals(self, rows: List[dict]) -> None:
+    def insert(self, rows: List[dict]) -> None:
         if not rows:
             return
         endpoint = f"{self.url}/rest/v1/{self.table}"
-        # on_conflict dedupe on dedupe_key if your table has it
         params = {"on_conflict": "dedupe_key"}
         r = self.s.post(endpoint, params=params, data=json.dumps(rows))
         if r.status_code >= 300:
             print(f"[DB][ERR] insert {r.status_code}: {r.text}", file=sys.stderr)
 
-    def patch_signal(self, dedupe_key: str, updates: dict) -> None:
-        if not dedupe_key:
-            return
-        endpoint = f"{self.url}/rest/v1/{self.table}"
-        params = {"dedupe_key": f"eq.{dedupe_key}", "select": "*"}
-        r = self.s.patch(endpoint, params=params, data=json.dumps(updates))
-        if r.status_code >= 300:
-            print(f"[DB][ERR] patch {r.status_code}: {r.text}", file=sys.stderr)
 
-
-# ==============================
-# Candle fetching (CCXT + cache)
-# ==============================
+# =============== CCXT + cache ===============
 def get_exchange(name: str):
     if ccxt is None:
-        raise RuntimeError("ccxt not installed. Add it to requirements.txt.")
+        raise RuntimeError("ccxt not installed. Add to requirements.txt")
     name = (name or "binance").lower()
     if not hasattr(ccxt, name):
-        raise RuntimeError(f"Unknown exchange for ccxt: {name}")
+        raise RuntimeError(f"Unknown ccxt exchange: {name}")
     ex = getattr(ccxt, name)({"enableRateLimit": True})
-    # Use futures where available for continuity
     if hasattr(ex, "options"):
         ex.options.setdefault("defaultType", "future")
     return ex
 
-
 def fetch_ohlcv_cached(symbol: str, timeframe: str, since_ms: int, until_ms: int,
-                       cache_dir: str, exchange_name: str = "binance") -> pd.DataFrame:
+                       cache_dir: str, exchange_name: str) -> pd.DataFrame:
     ensure_dir(cache_dir)
     ex = get_exchange(exchange_name)
     tf_ms = ex.parse_timeframe(timeframe) * 1000
@@ -153,14 +128,13 @@ def fetch_ohlcv_cached(symbol: str, timeframe: str, since_ms: int, until_ms: int
         except Exception:
             cached = None
 
-    rows: List[dict] = [] if cached is None else cached.to_dict("records")
+    rows = [] if cached is None else cached.to_dict("records")
     start_ms = since_ms if cached is None else int(cached["t"].iloc[-1]) + tf_ms
 
     if start_ms <= until_ms:
         fetch_from = start_ms
         while fetch_from < until_ms:
-            limit = 1000
-            batch = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=fetch_from, limit=limit)
+            batch = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=fetch_from, limit=1000)
             if not batch:
                 break
             for o in batch:
@@ -169,7 +143,8 @@ def fetch_ohlcv_cached(symbol: str, timeframe: str, since_ms: int, until_ms: int
                 rows.append({"t": int(o[0]), "o": float(o[1]), "h": float(o[2]),
                              "l": float(o[3]), "c": float(o[4]), "v": float(o[5])})
             fetch_from = batch[-1][0] + tf_ms
-            time.sleep(ex.rateLimit / 1000.0)  # gentle
+            # gentle rate limit
+            time.sleep(ex.rateLimit / 1000.0)
 
     df = pd.DataFrame(rows).drop_duplicates("t").sort_values("t")
     if not df.empty:
@@ -177,26 +152,19 @@ def fetch_ohlcv_cached(symbol: str, timeframe: str, since_ms: int, until_ms: int
     return df
 
 
-# ==============================
-# Strategy logic (BOS/SFP + zone)
-# ==============================
+# =============== Strategy core ===============
 def series_atr(h: pd.Series, l: pd.Series, c: pd.Series, length: int = 14) -> pd.Series:
     prev_close = c.shift(1)
-    tr = pd.concat([
-        h - l,
-        (h - prev_close).abs(),
-        (l - prev_close).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat([(h - l).abs(),
+                    (h - prev_close).abs(),
+                    (l - prev_close).abs()], axis=1).max(axis=1)
     return tr.rolling(length).mean()
 
-
 def pivots(h: pd.Series, l: pd.Series, left: int = 2, right: int = 2) -> Tuple[pd.Series, pd.Series]:
-    """Boolean series for swing highs/lows using a simple fixed window."""
     w = left + right + 1
     sh = (h.shift(left).rolling(w).max() == h) & (h == h.rolling(w, center=True).max())
     sl = (l.shift(left).rolling(w).min() == l) & (l == l.rolling(w, center=True).min())
     return sh.fillna(False), sl.fillna(False)
-
 
 def market_regime(close: pd.Series, lookback: int = 50) -> str:
     if len(close) < lookback + 5:
@@ -206,7 +174,6 @@ def market_regime(close: pd.Series, lookback: int = 50) -> str:
     slope = np.polyfit(x, y, 1)[0]
     return "trending" if abs(slope) > (np.std(y) * 0.002) else "ranging"
 
-
 def directional_bias(close: pd.Series, lookback: int = 50) -> str:
     if len(close) < lookback:
         return "neutral"
@@ -215,124 +182,129 @@ def directional_bias(close: pd.Series, lookback: int = 50) -> str:
 
 def detect_signal(df: pd.DataFrame) -> Optional[Dict]:
     """
-    Detect either BOS (body breaks last swing) or SFP (wick through, close back).
-    Builds the wick->body zone from the impulse bar (previous bar).
+    Detect BOS / SFP using the last ~60 bars window.
+    IMPORTANT: compute swing masks on the *window slice*,
+    then use .loc[mask, 'col'] to avoid Pandas reindex warnings.
     """
     if len(df) < 80:
         return None
-    o, h, l, c = df.o, df.h, df.l, df.c
-    sh, sl = pivots(h, l, 2, 2)
 
-    look = df.iloc[-60:]
-    last_swing_high = look[sh].h.max() if (look[sh].shape[0] > 0) else None
-    last_swing_low  = look[sl].l.min() if (look[sl].shape[0] > 0) else None
+    # Windowed view
+    look = df.iloc[-60:].copy()
+    # Compute pivots on the *slice* (aligned index)
+    sh_mask, sl_mask = pivots(look["h"], look["l"], 2, 2)
 
-    atrv = series_atr(h, l, c, 14).iloc[-1]
-    reg = market_regime(c)
-    b   = directional_bias(c)
+    # Safely compute swing levels
+    last_swing_high = float(look.loc[sh_mask, "h"].max()) if sh_mask.any() else None
+    last_swing_low  = float(look.loc[sl_mask, "l"].min()) if sl_mask.any() else None
 
-    # SFP
+    atrv = float(series_atr(df["h"], df["l"], df["c"], 14).iloc[-1])
+    reg = market_regime(df["c"])
+    bias = directional_bias(df["c"])
+
+    # Current bar
+    h, l, c = float(df["h"].iloc[-1]), float(df["l"].iloc[-1]), float(df["c"].iloc[-1])
+
+    # --- SFP conditions: wick through, close back
     sfp_kind, sfp_level = None, None
-    if last_swing_high is not None and h.iloc[-1] > last_swing_high and c.iloc[-1] < last_swing_high:
-        sfp_kind, sfp_level = "bearish", float(last_swing_high)
-    if last_swing_low is not None and l.iloc[-1] < last_swing_low and c.iloc[-1] > last_swing_low:
+    if last_swing_high is not None and h > last_swing_high and c < last_swing_high:
+        sfp_kind, sfp_level = "bearish", last_swing_high
+    if last_swing_low is not None and l < last_swing_low and c > last_swing_low:
         if sfp_kind is None:
-            sfp_kind, sfp_level = "bullish", float(last_swing_low)
+            sfp_kind, sfp_level = "bullish", last_swing_low
 
-    # BOS
+    # --- BOS conditions: body close breaks
     bos_kind, bos_level = None, None
-    if last_swing_high is not None and c.iloc[-1] > last_swing_high:
-        bos_kind, bos_level = "bullish", float(last_swing_high)
-    if last_swing_low is not None and c.iloc[-1] < last_swing_low:
+    if last_swing_high is not None and c > last_swing_high:
+        bos_kind, bos_level = "bullish", last_swing_high
+    if last_swing_low is not None and c < last_swing_low:
         if bos_kind is None:
-            bos_kind, bos_level = "bearish", float(last_swing_low)
+            bos_kind, bos_level = "bearish", last_swing_low
 
-    # prefer BOS over SFP if both
-    if bos_kind:
-        direction = "bullish" if bos_kind == "bullish" else "bearish"
-        imp = df.iloc[-2]  # impulse bar
+    # Build zone from the *impulse* bar (previous bar)
+    imp = df.iloc[-2]
+    def build_zone(direction: str) -> Tuple[float, float, float, float]:
         if direction == "bullish":
             z_top = float(max(imp.o, imp.c))
             z_bot = float(min(imp.l, imp.o, imp.c))
+            entry = z_bot
+            stop = entry - 0.8 * atrv
+            tp1 = entry + (entry - stop) * 1.6
         else:
             z_top = float(max(imp.h, imp.o, imp.c))
             z_bot = float(min(imp.o, imp.c))
-        entry = z_bot if direction == "bullish" else z_top
-        stop  = entry - atrv*0.8 if direction == "bullish" else entry + atrv*0.8
-        tp1   = entry + (entry - stop)*1.6 if direction == "bullish" else entry - (stop - entry)*1.6
-        score = 80.0 + (10.0 if reg == "trending" else 0.0)
-        if (direction == "bullish" and b == "bullish") or (direction == "bearish" and b == "bearish"):
-            score += 10.0
-        clean = abs(z_top - z_bot) / max(1e-8, atrv)
-        score += max(0.0, 10.0 - min(10.0, clean*2))
+            entry = z_top
+            stop = entry + 0.8 * atrv
+            tp1 = entry - (stop - entry) * 1.6
+        return z_top, z_bot, entry, stop, tp1
+
+    def score_base(direction: str, reg: str, bias: str, width: float, atrv: float, base: float) -> float:
+        s = base
+        if (direction == "bullish" and bias == "bullish") or (direction == "bearish" and bias == "bearish"):
+            s += 10.0
+        if reg == ("trending" if base >= 80 else "ranging"):
+            s += 10.0
+        clean_penalty = max(0.0, min(10.0, (width / max(1e-9, atrv)) * 2))
+        return round(s + max(0.0, 10.0 - clean_penalty), 2)
+
+    # Prefer BOS over SFP if both
+    if bos_kind:
+        direction = "bullish" if bos_kind == "bullish" else "bearish"
+        z_top, z_bot, entry, stop, tp1 = build_zone(direction)
+        width = abs(z_top - z_bot)
+        score = score_base(direction, reg, bias, width, atrv, base=80.0)
         return {
             "type": "BOS", "direction": direction,
             "zone_kind": "bullish" if direction == "bullish" else "bearish",
             "zone_top": z_top, "zone_bottom": z_bot,
             "level": float(bos_level),
             "entry": float(entry), "stop": float(stop), "tp1": float(tp1),
-            "atr": float(atrv), "score": round(score, 2),
-            "reasons": f"bos•reg:{reg}•bias:{b}•zoneW:{abs(z_top-z_bot):.4f}•atr:{atrv:.4f}",
+            "atr": float(atrv), "score": score,
+            "reasons": f"bos•reg:{reg}•bias:{bias}•zoneW:{width:.5f}•atr:{atrv:.5f}",
         }
 
     if sfp_kind:
         direction = "bearish" if sfp_kind == "bearish" else "bullish"
-        imp = df.iloc[-2]
-        if direction == "bullish":
-            z_top = float(max(imp.o, imp.c))
-            z_bot = float(min(imp.l, imp.o, imp.c))
-        else:
-            z_top = float(max(imp.h, imp.o, imp.c))
-            z_bot = float(min(imp.o, imp.c))
-        entry = z_bot if direction == "bullish" else z_top
-        stop  = entry - 0.9*series_atr(df.h, df.l, df.c, 14).iloc[-1] if direction == "bullish" else entry + 0.9*series_atr(df.h, df.l, df.c, 14).iloc[-1]
-        tp1   = entry + (entry - stop)*1.6 if direction == "bullish" else entry - (stop - entry)*1.6
-        score = 70.0 + (10.0 if reg == "ranging" else 0.0)
-        if (direction == "bullish" and b == "bullish") or (direction == "bearish" and b == "bearish"):
-            score += 10.0
-        clean = abs(z_top - z_bot) / max(1e-8, series_atr(df.h, df.l, df.c, 14).iloc[-1])
-        score += max(0.0, 10.0 - min(10.0, clean*2))
+        z_top, z_bot, entry, stop, tp1 = build_zone(direction)
+        width = abs(z_top - z_bot)
+        score = score_base(direction, reg, bias, width, atrv, base=70.0)
         return {
             "type": "SFP", "direction": direction,
             "zone_kind": "bullish" if direction == "bullish" else "bearish",
             "zone_top": z_top, "zone_bottom": z_bot,
             "level": float(sfp_level),
             "entry": float(entry), "stop": float(stop), "tp1": float(tp1),
-            "atr": float(series_atr(df.h, df.l, df.c, 14).iloc[-1]),
-            "score": round(score, 2),
-            "reasons": f"sfp•reg:{reg}•bias:{b}•zoneW:{abs(z_top-z_bot):.4f}",
+            "atr": float(atrv), "score": score,
+            "reasons": f"sfp•reg:{reg}•bias:{bias}•zoneW:{width:.5f}•atr:{atrv:.5f}",
         }
 
     return None
 
 
-# ==============================
-# Outcome simulation
-# ==============================
+# =============== Outcome simulation ===============
 def simulate_forward(df: pd.DataFrame, start_i: int, direction: str,
                      entry: float, stop: float, tp1: float) -> Tuple[str, float, int, Optional[int], Optional[int], Optional[float]]:
     """
-    Walk future bars to determine outcome:
+    Walk forward bars:
       - wait for limit entry hit
-      - after entry, SL has priority if both hit in same bar
-      - returns: outcome, rr, minutes_in_trade, enter_t, exit_t, exit_price
+      - after entry fill, SL takes priority if same-bar hits both
+    Returns: (outcome, rr, minutes_in_trade, enter_t, exit_t, exit_price)
     """
     enter_t = None
     exit_t, exit_px = None, None
     rr = abs((tp1 - entry) / (entry - stop)) if (entry - stop) != 0 else 0.0
 
-    def touched(px_low, px_high, price) -> bool:
-        return px_low <= price <= px_high
+    def touched(low, high, price) -> bool:
+        return low <= price <= high
 
     for i in range(start_i + 1, len(df)):
         row = df.iloc[i]
-        low, high, t = row["l"], row["h"], int(row["t"])
+        low, high, t = float(row["l"]), float(row["h"]), int(row["t"])
 
         if enter_t is None:
-            # limit fill
             if touched(low, high, entry):
                 enter_t = t
-                # after fill, evaluate SL first (adverse priority)
+                # SL priority
                 if direction == "bullish":
                     if low <= stop:
                         return "sl", -1.0, 0, enter_t, t, stop
@@ -360,13 +332,10 @@ def simulate_forward(df: pd.DataFrame, start_i: int, direction: str,
     return "open", 0.0, int((int(df.iloc[-1]["t"]) - enter_t) / 60000), enter_t, None, None
 
 
-# ==============================
-# Backtest runner
-# ==============================
+# =============== Runner ===============
 def run_backtest(cfg: dict, args):
-    # Robust: cfg might be string if something upstream passed it wrong
     if isinstance(cfg, str):
-        cfg = parse_yaml_maybe(cfg)
+        cfg = parse_yaml_maybe(cfg) or {}
         if not isinstance(cfg, dict):
             cfg = {}
 
@@ -378,26 +347,28 @@ def run_backtest(cfg: dict, args):
     symbols = args.symbols or research.get("symbols", ["BTC/USDT", "ETH/USDT", "SOL/USDT"])
     timeframes = args.timeframes or research.get("timeframes", ["1m"])
     days = int(args.days or research.get("days", 30))
-    min_score = float(args.min_score or research.get("min_score", 0))
+    min_score = float(args.min_score or research.get("min_score", 70))
     cache_dir = args.cache or research.get("cache_dir", "cache")
     save_csv = True if args.save_csv is None else args.save_csv
     push_db = True if args.push_db is None else args.push_db
     signals_table = research.get("signals_table", cfg.get("supabase", {}).get("signals_table", "signals"))
+    debug = env_flag("RESEARCH_DEBUG", False)
 
     sb_url = os.environ.get("SUPABASE_URL")
     sb_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
     supa = None
     if push_db and sb_url and sb_key:
         supa = Supa(sb_url, sb_key, signals_table)
-        print(f"[DB] Connected {sb_url} / table={signals_table}")
+        print(f"[DB] Connected {sb_url}/  / table={signals_table}")
     elif push_db:
-        print("[DB] Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY; will skip DB writes.")
+        print("[DB] Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY — skipping DB writes")
 
     until = utc_now()
     since = until - dt.timedelta(days=days)
     since_ms, until_ms = to_ms(since), to_ms(until)
 
-    print(f"[RESEARCH] ex={exchange} symbols={symbols} tfs={timeframes} range={since.isoformat()} → {until.isoformat()} min_score={min_score}")
+    print(f"[RESEARCH] exchange={exchange} symbols={symbols} tfs={timeframes} "
+          f"range={since.isoformat()} → {until.isoformat()} min_score={min_score}")
 
     for sym in symbols:
         for tf in timeframes:
@@ -412,12 +383,9 @@ def run_backtest(cfg: dict, args):
             for i in range(window, len(df) - 1):
                 sub = df.iloc[i - window:i + 1].copy()
                 sig = detect_signal(sub)
-                if not sig:
-                    continue
-                if sig["score"] < min_score:
+                if not sig or sig["score"] < min_score:
                     continue
 
-                # simulate forward from i
                 outcome, rr, mins, enter_t, exit_t, exit_px = simulate_forward(
                     df, i, sig["direction"], sig["entry"], sig["stop"], sig["tp1"]
                 )
@@ -443,40 +411,39 @@ def run_backtest(cfg: dict, args):
                 }
                 out_rows.append(row)
 
-                # periodic flush
+                if debug:
+                    print(f"[SIG] {sym} {tf} {row['type']} {row['direction']} "
+                          f"score={row['score']} outcome={outcome} rr={rr:.2f}")
+
+                # periodic flush to DB
                 if supa and len(out_rows) >= 250:
-                    supa.insert_signals(out_rows)
+                    supa.insert(out_rows)
                     out_rows = []
 
             # final flush
             if supa and out_rows:
-                supa.insert_signals(out_rows)
+                supa.insert(out_rows)
 
             if save_csv:
-                outdir = pathlib.Path("backtests")
-                ensure_dir(outdir.as_posix())
-                outfile = outdir / f"{sym.replace('/','-')}_{tf}_{days}d.csv"
+                ensure_dir("backtests")
+                outfile = pathlib.Path("backtests") / f"{sym.replace('/','-')}_{tf}_{days}d.csv"
                 pd.DataFrame(out_rows).to_csv(outfile, index=False)
                 print(f"[SAVE] {outfile} ({len(out_rows)} rows)")
 
     print("[DONE] research run complete.")
 
 
-# ==============================
-# CLI
-# ==============================
+# =============== CLI ===============
 def build_argparser():
     p = argparse.ArgumentParser(description="StructureBot Research Mode Backtester")
-    p.add_argument("--exchange", type=str, default=None, help="ccxt exchange (default from config, else binance)")
-    p.add_argument("--symbols", type=lambda s: [x.strip() for x in s.split(",")], default=None,
-                   help="comma-separated symbols, e.g. BTC/USDT,ETH/USDT")
-    p.add_argument("--timeframes", type=lambda s: [x.strip() for x in s.split(",")], default=None,
-                   help="comma-separated tfs, e.g. 1m,5m,15m")
-    p.add_argument("--days", type=int, default=None, help="lookback days")
-    p.add_argument("--min_score", type=float, default=None, help="minimum score filter")
-    p.add_argument("--cache", type=str, default=None, help="cache directory")
-    p.add_argument("--no-db", dest="push_db", action="store_false", help="disable Supabase writes")
-    p.add_argument("--no-csv", dest="save_csv", action="store_false", help="disable CSV saving")
+    p.add_argument("--exchange", type=str, default=None)
+    p.add_argument("--symbols", type=lambda s: [x.strip() for x in s.split(",")], default=None)
+    p.add_argument("--timeframes", type=lambda s: [x.strip() for x in s.split(",")], default=None)
+    p.add_argument("--days", type=int, default=None)
+    p.add_argument("--min_score", type=float, default=None)
+    p.add_argument("--cache", type=str, default=None)
+    p.add_argument("--no-db", dest="push_db", action="store_false")
+    p.add_argument("--no-csv", dest="save_csv", action="store_false")
     return p
 
 
