@@ -1,83 +1,135 @@
-# ===== StructureBot master config =====
+# =============================
+# StructureBot v2 — Config
+# =============================
 
-# markets to scan live
 symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-timeframes: ["1m", "5m", "15m"]
+timeframes: ["1m", "5m"]
 
-# scanning
-lookback_bars: 500         # bars requested per scan
-poll_seconds: 45           # sleep between scan cycles
-dedupe_minutes: 30         # prevent duplicate alerts within this window
+lookback_bars: 600           # bars to fetch per scan
+poll_seconds: 45             # sleep between cycles (per worker)
 
-# risk & trade plan
+# =============================
+# Risk / trade plan
+# =============================
 risk:
-  tp_rr: 1.6               # TP1 ~ R multiple
-  stop_atr_mult: 0.8       # how many ATR beyond the zone edge
-  retest_offset_pct: 0.10  # enter offset within the zone [0..1]
+  # dynamic offset: if "auto", code calculates a fraction of zone width
+  # based on width/ATR (clamped to 5%..25%)
+  retest_offset_pct: "auto"
+  # stop is placed beyond the *opposite zone edge* by this ATR multiple
+  stop_atr_mult: 0.25
+  # first target in R (relative to risk)
+  tp_rr: 1.6
 
-# regime + impulse discovery
-regime:
-  atr_ma_len: 50
-  trend_ratio_min: 1.2     # >=> "trending", otherwise "ranging"
-
+# =============================
+# Signal detection
+# =============================
 impulse:
   atr_len: 14
-  body_min: 0.55           # min candle body / range to count as impulse
-  atr_mult: 1.1            # min range vs ATR to count as impulse
-  min_consecutive: 1       # how many consecutive impulse candles to accept
+  body_min: 0.5
+  atr_mult: 1.0
+  min_consecutive: 1
 
-# zones
 zones:
-  max_zone_pct: 0.35       # clamp zone thickness relative to impulse range
+  # max % of the impulse range used as zone thickness
+  max_zone_pct: 0.50
 
-# signal logic
 signals:
-  confirm_closes: 1        # consecutive closes for BOS confirmation
-  sfp_window: 5            # lookback bars for SFP wick-through
+  confirm_closes: 1        # closes needed beyond zone for BOS
+  sfp_window: 3            # lookback bars for SFP
 
-# scoring & gates
+# =============================
+# Scoring system (still used for logging, but gate is higher)
+# =============================
 scoring:
-  min_score_to_alert: 70
-  tf_overrides:            # per-timeframe gates (optional)
-    "1m": 70
-    "5m": 75
-    "15m": 80
-  w_zone_strength: 0.40
+  min_score_to_alert: 90
+  tf_overrides:
+    "1m": 92
+    "5m": 90
+  w_zone_strength: 0.35
   w_signal_clean: 0.35
-  w_regime: 0.15
+  w_regime: 0.20
   w_bias: 0.10
 
-# filters
+# =============================
+# Filters (HARD)
+# =============================
 filters:
   use_htf_bias: true
-  htf_timeframe: "1h"
+  htf_timeframe: "15m"
 
-# startup backfill (produce immediate recent alerts on boot)
+  # Minimum rolling ATR percentile (over the last 200 bars) required to trade
+  # e.g., 40 means skip bottom-40%-volatility conditions
+  min_atr_percentile: 40
+
+  # Per-symbol/timeframe allow-lists for types and hours (UTC)
+  allowed:
+    BTC/USDT:
+      "1m":
+        types: ["BOS"]                      # disable BTC/1m SFP for now
+        hours_utc: [0,5,10,22,23]
+    ETH/USDT:
+      "1m":
+        types: ["BOS","SFP"]
+        hours_utc: [1,5,7,14,19,22,23]
+    SOL/USDT:
+      "1m":
+        types: ["BOS","SFP"]
+        hours_utc: [0,1,5,7,9,15,16,17,19,22,23]
+
+# =============================
+# Regime (used and enforced)
+# =============================
+regime:
+  atr_ma_len: 50
+  trend_ratio_min: 1.5
+
+# =============================
+# Startup backfill (first boot only)
+# =============================
 startup_backfill:
   enabled: true
-  lookback_bars: 300
+  lookback_bars: 250
   max_signals_per_market: 5
 
-# outcome monitor (entry/TP/SL detection)
-outcomes:
-  tf_for_check: "1m"       # candle spacing to walk for outcomes
-  max_age_hours: 24        # mark timeout after this if still open
-  miss_after_hours: 6      # if never entered within this window → "missed"
-  poll_seconds: 60         # how often to re-check outcomes
-  post_to_discord: true
+# =============================
+# Debug / logging
+# =============================
+debug:
+  log_scans: true
+  log_zones: false
+  heartbeat_minutes: 2
 
-# research/backtest defaults (used by backtest_runner.py)
+# =============================
+# Supabase
+# =============================
+supabase:
+  signals_table: "signals"
+
+# =============================
+# Discord
+# =============================
+discord_webhook_url: ${DISCORD_WEBHOOK_URL}
+
+# =============================
+# Research mode
+# =============================
 research:
-  exchange: "binance"
+  exchange: binance
   symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
   timeframes: ["1m"]
   days: 30
-  min_score: 70
+  min_score: 90
   cache_dir: "cache"
+  push_to_supabase: true
+  save_csv: true
   signals_table: "signals"
 
-# optional debug switches
-debug:
-  log_scans: false
-  log_zones: false
-  heartbeat_minutes: 2
+# =============================
+# Outcomes worker (live/optional)
+# =============================
+outcomes:
+  tf_for_check: "1m"
+  max_age_hours: 8
+  miss_after_hours: 2
+  poll_seconds: 60
+  post_to_discord: false
