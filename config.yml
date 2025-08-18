@@ -5,20 +5,16 @@
 symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 timeframes: ["1m", "5m"]
 
-lookback_bars: 600           # bars to fetch per scan
-poll_seconds: 45             # sleep between cycles (per worker)
+lookback_bars: 600
+poll_seconds: 45
 
 # =============================
 # Risk / trade plan
 # =============================
 risk:
-  # dynamic offset: if "auto", code calculates a fraction of zone width
-  # based on width/ATR (clamped to 5%..25%)
-  retest_offset_pct: "auto"
-  # stop is placed beyond the *opposite zone edge* by this ATR multiple
-  stop_atr_mult: 0.25
-  # first target in R (relative to risk)
-  tp_rr: 1.6
+  retest_offset_pct: "auto"   # dynamic offset (5–25% of zone width, scaled by ATR)
+  stop_atr_mult: 0.8          # ATR pad beyond opposite zone edge (more robust than 0.25)
+  tp_rr: 1.6                  # first target in R
 
 # =============================
 # Signal detection
@@ -30,15 +26,14 @@ impulse:
   min_consecutive: 1
 
 zones:
-  # max % of the impulse range used as zone thickness
   max_zone_pct: 0.50
 
 signals:
-  confirm_closes: 1        # closes needed beyond zone for BOS
-  sfp_window: 3            # lookback bars for SFP
+  confirm_closes: 1
+  sfp_window: 3
 
 # =============================
-# Scoring system (still used for logging, but gate is higher)
+# Scoring system
 # =============================
 scoring:
   min_score_to_alert: 90
@@ -57,31 +52,39 @@ filters:
   use_htf_bias: true
   htf_timeframe: "15m"
 
-  # Minimum rolling ATR percentile (over the last 200 bars) required to trade
-  # e.g., 40 means skip bottom-40%-volatility conditions
+  # Require ATR to be above the 40th percentile of last 200 bars
   min_atr_percentile: 40
 
   # Per-symbol/timeframe allow-lists for types and hours (UTC)
   allowed:
     BTC/USDT:
       "1m":
-        types: ["BOS"]                      # disable BTC/1m SFP for now
-        hours_utc: [0,5,10,22,23]
+        types: ["BOS"]                      # BTC/1m SFP was weak; start BOS-only
+        hours_utc: [0,1,5,6,10,11,22,23]
+      "5m":
+        types: ["BOS","SFP"]
+        hours_utc: [0,1,5,6,10,11,14,15,22,23]
     ETH/USDT:
       "1m":
         types: ["BOS","SFP"]
-        hours_utc: [1,5,7,14,19,22,23]
+        hours_utc: [0,1,4,5,7,11,14,19,22,23]
+      "5m":
+        types: ["BOS","SFP"]
+        hours_utc: [0,1,4,5,7,11,14,19,22,23]
     SOL/USDT:
       "1m":
         types: ["BOS","SFP"]
         hours_utc: [0,1,5,7,9,15,16,17,19,22,23]
+      "5m":
+        types: ["BOS","SFP"]
+        hours_utc: [0,1,5,7,9,15,16,17,19,22,23]
 
 # =============================
-# Regime (used and enforced)
+# Regime (enforced)
 # =============================
 regime:
   atr_ma_len: 50
-  trend_ratio_min: 1.5
+  trend_ratio_min: 1.5       # BOS->trending, SFP->ranging
 
 # =============================
 # Startup backfill (first boot only)
