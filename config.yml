@@ -1,107 +1,83 @@
-# =============================
-# StructureBot Config
-# =============================
+# ===== StructureBot master config =====
 
-symbols:
-  - "BTC/USDT"
-  - "ETH/USDT"
-  - "SOL/USDT"
+# markets to scan live
+symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+timeframes: ["1m", "5m", "15m"]
 
-timeframes:
-  - "1m"
-  - "5m"
+# scanning
+lookback_bars: 500         # bars requested per scan
+poll_seconds: 45           # sleep between scan cycles
+dedupe_minutes: 30         # prevent duplicate alerts within this window
 
-lookback_bars: 500
-poll_seconds: 30
-
-# =============================
-# Risk / trade plan
-# =============================
+# risk & trade plan
 risk:
-  retest_offset_pct: 0.1     # entry offset into zone
-  stop_atr_mult: 0.8         # stop size relative to ATR
-  tp_rr: 1.6                 # TP1 RR multiple
+  tp_rr: 1.6               # TP1 ~ R multiple
+  stop_atr_mult: 0.8       # how many ATR beyond the zone edge
+  retest_offset_pct: 0.10  # enter offset within the zone [0..1]
 
-# =============================
-# Signal detection
-# =============================
-impulse:
-  atr_len: 14
-  body_min: 0.5
-  atr_mult: 1.0
-  min_consecutive: 1
-
-zones:
-  max_zone_pct: 0.5          # max % of impulse size for zone thickness
-
-signals:
-  confirm_closes: 1          # closes needed beyond zone for BOS
-  sfp_window: 3              # lookback bars for SFP
-
-# =============================
-# Scoring system
-# =============================
-scoring:
-  min_score_to_alert: 70
-  tf_overrides:
-    "1m": 70
-    "5m": 75
-  w_zone_strength: 0.4
-  w_signal_clean: 0.3
-  w_regime: 0.2
-  w_bias: 0.1
-
-# =============================
-# Filters
-# =============================
-filters:
-  use_htf_bias: true
-  htf_timeframe: "15m"
-
-# =============================
-# Regime detection
-# =============================
+# regime + impulse discovery
 regime:
   atr_ma_len: 50
-  trend_ratio_min: 1.5
+  trend_ratio_min: 1.2     # >=> "trending", otherwise "ranging"
 
-# =============================
-# Startup backfill
-# =============================
+impulse:
+  atr_len: 14
+  body_min: 0.55           # min candle body / range to count as impulse
+  atr_mult: 1.1            # min range vs ATR to count as impulse
+  min_consecutive: 1       # how many consecutive impulse candles to accept
+
+# zones
+zones:
+  max_zone_pct: 0.35       # clamp zone thickness relative to impulse range
+
+# signal logic
+signals:
+  confirm_closes: 1        # consecutive closes for BOS confirmation
+  sfp_window: 5            # lookback bars for SFP wick-through
+
+# scoring & gates
+scoring:
+  min_score_to_alert: 70
+  tf_overrides:            # per-timeframe gates (optional)
+    "1m": 70
+    "5m": 75
+    "15m": 80
+  w_zone_strength: 0.40
+  w_signal_clean: 0.35
+  w_regime: 0.15
+  w_bias: 0.10
+
+# filters
+filters:
+  use_htf_bias: true
+  htf_timeframe: "1h"
+
+# startup backfill (produce immediate recent alerts on boot)
 startup_backfill:
   enabled: true
-  lookback_bars: 200
+  lookback_bars: 300
   max_signals_per_market: 5
 
-# =============================
-# Debug / logging
-# =============================
-debug:
-  log_scans: true
-  log_zones: true
-  heartbeat_minutes: 2
+# outcome monitor (entry/TP/SL detection)
+outcomes:
+  tf_for_check: "1m"       # candle spacing to walk for outcomes
+  max_age_hours: 24        # mark timeout after this if still open
+  miss_after_hours: 6      # if never entered within this window → "missed"
+  poll_seconds: 60         # how often to re-check outcomes
+  post_to_discord: true
 
-# =============================
-# Supabase
-# =============================
-supabase:
-  signals_table: "signals"
-
-# =============================
-# Discord
-# =============================
-discord_webhook_url: ${DISCORD_WEBHOOK_URL}
-
-# =============================
-# Research mode
-# =============================
+# research/backtest defaults (used by backtest_runner.py)
 research:
-  exchange: binance
+  exchange: "binance"
   symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
   timeframes: ["1m"]
   days: 30
   min_score: 70
   cache_dir: "cache"
-  push_to_supabase: true
-  save_csv: true
   signals_table: "signals"
+
+# optional debug switches
+debug:
+  log_scans: false
+  log_zones: false
+  heartbeat_minutes: 2
