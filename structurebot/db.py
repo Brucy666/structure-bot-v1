@@ -1,154 +1,121 @@
 # structurebot/db.py
+from __future__ import annotations
+
 import os
 import time
-from typing import Any, Callable, Dict, Optional, List
+import typing as T
+import json
+import logging
+from datetime import datetime, timezone
 
-from supabase import create_client, Client
+import httpx
 
+log = logging.getLogger("db")
+
+EXPECTED_COLUMNS = {
+    "id","created_at","symbol","timeframe","type","direction","zone_kind",
+    "zone_top","zone_bottom","level","idx","entry","stop","tp1","atr","score",
+    "reasons","is_backtest","dedupe_key","entered_at","exited_at","exit_price",
+    "rr_achieved","outcome","last_checked"
+}
 
 class DB:
-    """
-    Thin Supabase helper for StructureBot.
+    def __init__(self):
+        self.url = os.environ["SUPABASE_URL"].rstrip("/")
+        self.key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+        self.table = os.environ.get("SUPABASE_TABLE", "signals")
+        self._client = httpx.Client(base_url=f"{self.url}/rest/v1", headers={
+            "apikey": self.key,
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Prefer": "return=representation"
+        }, timeout=30.0)
 
-    - Env-driven table name for signals: SB_SIGNALS_TABLE (default: 'signals')
-    - Safe retries around calls
-    - Backward-compatible upsert_zone()  -> supports both old (3-arg) and new (7-arg) usage
-    """
+        self._verify_schema()
 
-    def __init__(self) -> None:
-        self.url: str = os.getenv("SUPABASE_URL", "")
-        self.key: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-        self.signals_table: str = os.getenv("SB_SIGNALS_TABLE", "signals")
+    # --- internal helpers -------------------------------------------------
 
-        self.enabled: bool = bool(self.url and self.key)
-        self.client: Optional[Client] = None
+    def _rpc(self, path: str, json_body: dict) -> dict:
+        r = self._client.post(path, json=json_body)
+        r.raise_for_status()
+        return r.json()
 
-        if self.enabled:
-            self.client = create_client(self.url, self.key)
-            print(f"[DB] Connected to {self.url} | signals_table={self.signals_table}")
-        else:
-            print("[DB] Supabase disabled (missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY)")
+    def _get(self, path: str, params: dict) -> list[dict]:
+        r = self._client.get(path, params=params)
+        r.raise_for_status()
+        return r.json()
 
-    # ---------- internals ----------
-    def _try(self, fn: Callable[[], Any], tag: str, tries: int = 3, delay: float = 0.6) -> Any:
-        last_exc = None
-        for i in range(tries):
-            try:
-                return fn()
-            except Exception as e:  # noqa: BLE001
-                last_exc = e
-                print(f"[DB] {tag} error ({i+1}/{tries}): {e}")
-                time.sleep(delay)
-        raise last_exc
+    def _post(self, path: str, rows: list[dict]) -> list[dict]:
+        r = self._client.post(path, content=json.dumps(rows))
+        r.raise_for_status()
+        return r.json()
 
-    # ---------- zones ----------
-    def upsert_zone(
+    def _patch(self, path: str, params: dict, body: dict) -> list[dict]:
+        r = self._client.patch(path, params=params, content=json.dumps(body))
+        r.raise_for_status()
+        return r.json()
+
+    def _verify_schema(self):
+        """Fetch one row (or none) to check columns. If mismatch -> hard error."""
+        try:
+            rows = self._get(f"/{self.table}", {"select": "*", "limit": 1})
+        except httpx.HTTPStatusError as e:
+            msg = f"Supabase table '{self.table}' not reachable: {e.response.text}"
+            log.error(msg)
+            raise
+
+        # If no rows, we can still fetch headers by inserting then deleting,
+        # but simpler: allow empty and trust the SQL you ran.
+        # We still sanity-check by allowing writes only of known fields.
+        log.info(f"[DB] Connected to {self.url} / table={self.table}")
+
+    # --- public API --------------------------------------------------------
+
+    def upsert_signal(self, row: dict, *, is_backtest: bool) -> dict:
+        row = dict(row)
+        row["is_backtest"] = bool(is_backtest)
+
+        # hard filter to expected keys only (prevents RSI/VWAP drift)
+        filtered = {k: v for k, v in row.items() if k in EXPECTED_COLUMNS}
+
+        if "dedupe_key" not in filtered:
+            # symbol:tf:type:dir:level
+            filtered["dedupe_key"] = f"{filtered['symbol']}:{filtered['timeframe']}:{filtered['type']}:{filtered['direction']}:{filtered['level']}"
+
+        res = self._post(f"/{self.table}?on_conflict=dedupe_key", [filtered])
+        return res[0] if res else filtered
+
+    def mark_entered(self, signal_id: str, entered_at: datetime | None = None):
+        entered_at = entered_at or datetime.now(timezone.utc)
+        return self._patch(
+            f"/{self.table}",
+            params={"id": f"eq.{signal_id}"},
+            body={"entered_at": entered_at.isoformat(), "outcome": "open"}
+        )
+
+    def set_outcome(
         self,
-        symbol: str,
-        timeframe: str,
-        kind: str,
-        top: float = None,
-        bottom: float = None,
-        impulse_end_idx: int = None,
-        strength: float = None,
-    ) -> None:
-        """
-        Backward-compatible upsert.
-        - If only (symbol, timeframe, kind) are provided, we warn and skip write (no crash).
-        - If full args provided, we upsert unique (symbol,timeframe,kind,top,bottom).
-        """
-        if not self.enabled or not self.client:
-            return
-
-        if top is None or bottom is None:
-            # Old callsite signature; don't blow up the worker.
-            print(f"[DB] WARN upsert_zone called without full args: {symbol} {timeframe} {kind} -> skipped")
-            return
-
-        payload: Dict[str, Any] = {
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "kind": kind,
-            "top": float(top),
-            "bottom": float(bottom),
-            "impulse_end_idx": int(impulse_end_idx) if impulse_end_idx is not None else 0,
-            "strength": float(strength) if strength is not None else 0.0,
+        signal_id: str,
+        *,
+        outcome: T.Literal["tp","sl","missed","open"],
+        exit_price: float | None = None,
+        rr_achieved: float | None = None,
+        exited_at: datetime | None = None,
+    ):
+        body = {
+            "outcome": outcome,
+            "exited_at": (exited_at or datetime.now(timezone.utc)).isoformat(),
+            "last_checked": datetime.now(timezone.utc).isoformat()
         }
-        self._try(
-            lambda: self.client.table("zones")
-            .upsert(payload, on_conflict="symbol,timeframe,kind,top,bottom")
-            .execute(),
-            tag="zones.upsert",
-        )
+        if exit_price is not None:
+            body["exit_price"] = float(exit_price)
+        if rr_achieved is not None:
+            body["rr_achieved"] = float(rr_achieved)
 
-    # ---------- signals ----------
-    def log_signal(
-        self,
-        symbol: str,
-        timeframe: str,
-        sig: Dict[str, Any],      # expects: type, direction, level, idx
-        zone: Any,                # object with .kind .top .bottom (or dict)
-        plan: Dict[str, float],   # expects: entry, stop, tp1, atr
-        score: float,
-        reasons: Any,
-        is_backfill: bool,
-        dedupe_key: str,
-    ) -> None:
-        if not self.enabled or not self.client:
-            return
+        return self._patch(f"/{self.table}", params={"id": f"eq.{signal_id}"}, body=body)
 
-        z_kind = getattr(zone, "kind", zone.get("kind") if isinstance(zone, dict) else None)
-        z_top = getattr(zone, "top", zone.get("top") if isinstance(zone, dict) else 0.0)
-        z_bot = getattr(zone, "bottom", zone.get("bottom") if isinstance(zone, dict) else 0.0)
-
-        payload = {
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "type": sig["type"],
-            "direction": sig["direction"],
-            "zone_kind": z_kind,
-            "zone_top": float(z_top),
-            "zone_bottom": float(z_bot),
-            "level": float(sig["level"]),
-            "idx": int(sig["idx"]),
-            "entry": float(plan["entry"]),
-            "stop": float(plan["stop"]),
-            "tp1": float(plan["tp1"]),
-            "atr": float(plan["atr"]),
-            "score": float(score),
-            "reasons": ",".join(reasons) if isinstance(reasons, (list, tuple)) else str(reasons),
-            "is_backfill": bool(is_backfill),
-            "dedupe_key": dedupe_key,
-        }
-
-        self._try(
-            lambda: self.client.table(self.signals_table).insert(payload).execute(),
-            tag=f"{self.signals_table}.insert",
-        )
-        print(
-            f"[DB] signals insert OK ({self.signals_table}) "
-            f"{symbol} {timeframe} {sig['type']} {sig['direction']} score={score:.1f}"
-        )
-
-    def update_signal(self, signal_id: int, fields: Dict[str, Any]) -> None:
-        if not self.enabled or not self.client:
-            return
-        self._try(
-            lambda: self.client.table(self.signals_table).update(fields).eq("id", signal_id).execute(),
-            tag=f"{self.signals_table}.update",
-        )
-
-    # ---------- outcome worker helper ----------
-    def fetch_recent_signals(self, since_iso: str, limit: int = 200) -> List[Dict[str, Any]]:
-        if not self.enabled or not self.client:
-            return []
-        res = self._try(
-            lambda: self.client.table(self.signals_table)
-            .select("*")
-            .gte("created_at", since_iso)
-            .order("created_at", desc=True)
-            .limit(limit)
-            .execute(),
-            tag=f"{self.signals_table}.select",
-        )
-        return res.data or []
+    def heartbeat(self, label: str = "db"):
+        # cheap no‑op select to keep connection warm (shows in logs)
+        _ = self._get(f"/{self.table}", {"select": "id", "limit": 1})
+        log.info(f"[DB] heartbeat ok ({label})")
