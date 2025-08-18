@@ -3,258 +3,234 @@ from __future__ import annotations
 
 import os
 import json
-import logging
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+import time
+import typing as T
+from datetime import datetime, timezone, timedelta
+from collections import OrderedDict
 
 import httpx
 
-log = logging.getLogger("db")
 
-# Only allow these fields to reach Supabase (prevents schema drift).
-SIGNAL_COLUMNS = {
-    "id", "created_at", "symbol", "timeframe",
-    "type", "direction", "zone_kind",
-    "zone_top", "zone_bottom", "level", "idx",
-    "entry", "stop", "tp1", "atr", "score",
-    "reasons", "is_backtest", "dedupe_key",
-    "entered_at", "exited_at", "exit_price",
-    "rr_achieved", "outcome", "last_checked",
-    # add "minutes_in_trade" only if you've added the column in SQL
-    # "minutes_in_trade",
+# Only fields we allow into Supabase (prevents stray columns like vwap/rsi, etc.)
+_ALLOWED_FIELDS = {
+    "id","created_at","symbol","timeframe","type","direction","zone_kind",
+    "zone_top","zone_bottom","level","idx","entry","stop","tp1","atr","score",
+    "reasons","is_backtest","dedupe_key","entered_at","exited_at","exit_price",
+    "rr_achieved","outcome","minutes_in_trade","last_checked"
 }
 
-ZONE_COLUMNS = {
-    "id", "created_at", "symbol", "timeframe",
-    "kind", "top", "bottom",
-    "impulse_end_idx", "strength"
-}
+
+class _TTLCache:
+    """Tiny in‑memory TTL cache for dedupe_keys to reduce duplicate writes."""
+    def __init__(self, maxlen: int = 5000, ttl_seconds: int = 3600):
+        self._store: "OrderedDict[str, float]" = OrderedDict()
+        self.maxlen = maxlen
+        self.ttl = float(ttl_seconds)
+
+    def add(self, key: str) -> None:
+        now = time.time()
+        self._store[key] = now
+        self._store.move_to_end(key)
+        self._prune(now)
+
+    def seen(self, key: str) -> bool:
+        ts = self._store.get(key)
+        if ts is None:
+            return False
+        if (time.time() - ts) > self.ttl:
+            # expired
+            self._store.pop(key, None)
+            return False
+        return True
+
+    def _prune(self, now: float) -> None:
+        # size bound
+        while len(self._store) > self.maxlen:
+            self._store.popitem(last=False)
+        # TTL sweep (cheap)
+        drop = [k for k, ts in self._store.items() if (now - ts) > self.ttl]
+        for k in drop:
+            self._store.pop(k, None)
 
 
 class DB:
-    """
-    Minimal Supabase REST client tailored for StructureBot.
-    Uses Service Role key (server-side only).
-    """
-
+    """Very small Supabase REST client with safe upserts + local dedupe."""
     def __init__(self) -> None:
-        url = os.environ.get("SUPABASE_URL", "").rstrip("/")
-        key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+        url = os.getenv("SUPABASE_URL", "").rstrip("/")
+        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+        table = os.getenv("SUPABASE_TABLE", "signals")
         if not url or not key:
-            raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set")
+            # allow the app to run without DB (e.g., local testing)
+            self.enabled = False
+            self.url = ""
+            self.key = ""
+            self.table = table
+            self._client = None
+            self._cache = _TTLCache()
+            return
 
+        self.enabled = True
         self.url = url
         self.key = key
-        self.signals_table = os.environ.get("SUPABASE_TABLE", "signals")
-        self.zones_table = os.environ.get("SUPABASE_ZONES_TABLE", "zones")
+        self.table = table
 
-        self.client = httpx.Client(
+        self._client = httpx.Client(
             base_url=f"{self.url}/rest/v1",
             headers={
                 "apikey": self.key,
                 "Authorization": f"Bearer {self.key}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
+                # This is the key line for merging duplicates server‑side
+                "Prefer": "resolution=merge-duplicates,return=representation",
             },
             timeout=30.0,
         )
+        self._cache = _TTLCache()
 
-        # Light connectivity check
-        try:
-            self._get(f"/{self.signals_table}", {"select": "id", "limit": 1})
-            log.info(f"[DB] Connected to {self.url}  | signals={self.signals_table}, zones={self.zones_table}")
-        except httpx.HTTPError as e:
-            raise RuntimeError(f"Supabase connection failed: {e}") from e
+    # ----------------- low-level -----------------
 
-        self.enabled = True
-
-    # ------------- low-level HTTP -----------------
-
-    def _get(self, path: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
-        r = self.client.get(path, params=params)
+    def _get(self, path: str, params: dict | None = None) -> list[dict]:
+        if not self.enabled:
+            return []
+        r = self._client.get(path, params=params or {})
         r.raise_for_status()
         return r.json()
 
-    def _post_rows(self, path: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        r = self.client.post(path, content=json.dumps(rows), headers={"Prefer": "return=representation"})
-        r.raise_for_status()
-        try:
-            return r.json()
-        except Exception:
+    def _post(self, path: str, rows: list[dict]) -> list[dict]:
+        if not self.enabled:
             return []
-
-    def _patch(self, path: str, params: Dict[str, Any], body: Dict[str, Any]) -> List[Dict[str, Any]]:
-        r = self.client.patch(path, params=params, content=json.dumps(body), headers={"Prefer": "return=representation"})
-        r.raise_for_status()
-        try:
-            return r.json()
-        except Exception:
+        # Ensure query params include on_conflict + return=representation
+        if "?" in path:
+            path = f"{path}&return=representation"
+        else:
+            path = f"{path}?return=representation"
+        r = self._client.post(path, content=json.dumps(rows))
+        # If we still ever hit 409 due to race, treat as non‑fatal
+        if r.status_code == 409:
             return []
+        r.raise_for_status()
+        return r.json()
 
-    # ------------- public helpers -----------------
+    def _patch(self, path: str, params: dict, body: dict) -> list[dict]:
+        if not self.enabled:
+            return []
+        r = self._client.patch(path, params=params, content=json.dumps(body))
+        r.raise_for_status()
+        return r.json()
 
-    # Signals -----------------------------------------------------------------
+    # ----------------- public API -----------------
 
     def log_signal(
         self,
         symbol: str,
         timeframe: str,
-        sig: Dict[str, Any],
-        zone: Any,
-        plan: Dict[str, Any],
+        sig: dict,
+        zone: T.Any,
+        plan: dict,
         score: float,
-        reasons: List[str],
-        is_backfill: bool,
+        reasons: list[str] | None,
+        is_backtest: bool,
         dedupe_key: str,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Insert (upsert-on-dedupe_key) one trading signal row.
-        """
+    ) -> None:
+        """Insert/merge a signal row (de‑duped locally + server side)."""
         if not self.enabled:
-            return None
+            print("[DB] disabled — skipping insert")
+            return
 
-        # Accept zone as object or dict
-        def zget(attr: str, default=None):
-            if isinstance(zone, dict):
-                return zone.get(attr, default)
-            return getattr(zone, attr, default)
+        # local dedupe (cheap)
+        if self._cache.seen(dedupe_key):
+            return
+        self._cache.add(dedupe_key)
 
         row = {
             "created_at": datetime.now(timezone.utc).isoformat(),
+
             "symbol": symbol,
             "timeframe": timeframe,
+
             "type": sig.get("type"),
             "direction": sig.get("direction"),
-            "zone_kind": zget("kind"),
-            "zone_top": float(zget("top", 0.0)),
-            "zone_bottom": float(zget("bottom", 0.0)),
+
+            "zone_kind": "bullish" if sig.get("direction") == "bullish" else "bearish",
+            "zone_top": float(getattr(zone, "top", sig.get("zone_top", 0.0))),
+            "zone_bottom": float(getattr(zone, "bottom", sig.get("zone_bottom", 0.0))),
+
             "level": float(sig.get("level", 0.0)),
             "idx": int(sig.get("idx", 0)),
+
             "entry": float(plan.get("entry", 0.0)),
             "stop": float(plan.get("stop", 0.0)),
             "tp1": float(plan.get("tp1", 0.0)),
             "atr": float(plan.get("atr", 0.0)),
             "score": float(score),
-            "reasons": ", ".join(reasons) if isinstance(reasons, list) else str(reasons),
-            "is_backtest": bool(is_backfill),
+
+            "reasons": ", ".join(reasons or []),
+
+            "is_backtest": bool(is_backtest),
             "dedupe_key": dedupe_key,
-            "outcome": None,
-            "last_checked": None,
         }
 
-        # hard filter to allowed keys (prevents stray cols like 'vwap', 'rsi')
-        payload = {k: v for k, v in row.items() if k in SIGNAL_COLUMNS}
+        # strict allow‑list
+        row = {k: v for k, v in row.items() if k in _ALLOWED_FIELDS}
 
-        try:
-            out = self._post_rows(
-                f"/{self.signals_table}?on_conflict=dedupe_key",
-                [payload],
-            )
-            return out[0] if out else payload
-        except httpx.HTTPError as e:
-            log.error(f"[DB] log_signal error: {e} :: {getattr(e.response, 'text', '')}")
-            return None
+        # server‑side merge on dedupe_key
+        self._post(f"/{self.table}?on_conflict=dedupe_key", [row])
 
-    def fetch_recent_signals(self, since_iso: str, limit: int = 200) -> List[Dict[str, Any]]:
-        """
-        Pull recent signals (for outcome worker).
-        """
+    def upsert_signal(self, row: dict, *, is_backtest: bool) -> None:
+        """Generic upsert if a caller already built the row."""
+        if not self.enabled:
+            return
+        row = dict(row)
+        row["is_backtest"] = bool(is_backtest)
+        if "dedupe_key" not in row:
+            # fallback: symbol:tf:type:dir:level (rounded)
+            row["dedupe_key"] = f"{row['symbol']}:{row['timeframe']}:{row['type']}:{row['direction']}:{round(float(row['level']),6)}"
+        key = row["dedupe_key"]
+        if self._cache.seen(key):
+            return
+        self._cache.add(key)
+
+        row = {k: v for k, v in row.items() if k in _ALLOWED_FIELDS}
+        self._post(f"/{self.table}?on_conflict=dedupe_key", [row])
+
+    def update_signal(self, signal_id: str, body: dict) -> None:
+        if not self.enabled:
+            return
+        self._patch(f"/{self.table}", params={"id": f"eq.{signal_id}"}, body=body)
+
+    def fetch_recent_signals(self, since_iso: str, limit: int = 200) -> list[dict]:
         if not self.enabled:
             return []
-        params = {
-            "select": "*",
-            "created_at": f"gte.{since_iso}",
-            "order": "created_at.desc",
-            "limit": max(1, min(limit, 1000)),
-        }
-        try:
-            return self._get(f"/{self.signals_table}", params)
-        except httpx.HTTPError as e:
-            log.error(f"[DB] fetch_recent_signals error: {e}")
-            return []
+        return self._get(
+            f"/{self.table}",
+            params={
+                "select": "*",
+                "created_at": f"gte.{since_iso}",
+                "order": "created_at.desc",
+                "limit": str(int(limit)),
+            },
+        )
 
-    def update_signal(self, signal_id: Any, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Generic patch by id.
-        """
+    # Optional helpers the scanners/worker use
+
+    def upsert_zone(self, symbol: str, timeframe: str, kind: str,
+                    top: float, bottom: float, impulse_end_idx: int, strength: float) -> None:
+        """If you have a zones table, write it here (safe no‑op otherwise)."""
         if not self.enabled:
-            return None
-        # filter allowed columns
-        body = {k: v for k, v in fields.items() if k in SIGNAL_COLUMNS}
+            return
         try:
-            out = self._patch(f"/{self.signals_table}", {"id": f"eq.{signal_id}"}, body)
-            return out[0] if out else None
-        except httpx.HTTPError as e:
-            log.error(f"[DB] update_signal error: {e} :: {getattr(e.response, 'text', '')}")
-            return None
-
-    # Zones -------------------------------------------------------------------
-
-    def upsert_zone(
-        self,
-        symbol: str,
-        timeframe: str,
-        kind: str,
-        top: float,
-        bottom: float,
-        impulse_end_idx: int,
-        strength: float,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Store latest detected zone snapshot.
-        """
-        if not self.enabled or not self.zones_table:
-            return None
-
-        row = {
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "kind": kind,
-            "top": float(top),
-            "bottom": float(bottom),
-            "impulse_end_idx": int(impulse_end_idx),
-            "strength": float(strength),
-        }
-        payload = {k: v for k, v in row.items() if k in ZONE_COLUMNS}
-
-        try:
-            out = self._post_rows(f"/{self.zones_table}", [payload])
-            return out[0] if out else payload
-        except httpx.HTTPError as e:
-            # zones table is optional—log and continue
-            log.warning(f"[DB] upsert_zone warn: {e} :: {getattr(e.response, 'text', '')}")
-            return None
-
-    # Convenience -------------------------------------------------------------
-
-    def mark_entered(self, signal_id: Any, entered_at: Optional[datetime] = None):
-        ts = (entered_at or datetime.now(timezone.utc)).isoformat()
-        return self.update_signal(signal_id, {"entered_at": ts, "outcome": "open"})
-
-    def set_outcome(
-        self,
-        signal_id: Any,
-        *,
-        outcome: str,  # "tp" | "sl" | "missed" | "open" | "timeout"
-        exit_price: Optional[float] = None,
-        rr_achieved: Optional[float] = None,
-        exited_at: Optional[datetime] = None,
-    ):
-        body = {
-            "outcome": outcome,
-            "exited_at": (exited_at or datetime.now(timezone.utc)).isoformat(),
-            "last_checked": datetime.now(timezone.utc).isoformat(),
-        }
-        if exit_price is not None:
-            body["exit_price"] = float(exit_price)
-        if rr_achieved is not None:
-            body["rr_achieved"] = float(rr_achieved)
-        return self.update_signal(signal_id, body)
-
-    def heartbeat(self, label: str = "db") -> None:
-        try:
-            _ = self._get(f"/{self.signals_table}", {"select": "id", "limit": 1})
-            log.info(f"[DB] heartbeat ok ({label})")
-        except httpx.HTTPError as e:
-            log.error(f"[DB] heartbeat failed: {e}")
+            payload = [{
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "kind": kind,
+                "top": float(top),
+                "bottom": float(bottom),
+                "impulse_end_idx": int(impulse_end_idx),
+                "strength": float(strength),
+                "dedupe_key": f"{symbol}:{timeframe}:{kind}:{round(top,6)}:{round(bottom,6)}:{impulse_end_idx}"
+            }]
+            self._post("/zones?on_conflict=dedupe_key", payload)
+        except Exception:
+            # zones table is optional; swallow errors to avoid breaking the bot
+            pass
