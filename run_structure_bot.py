@@ -288,7 +288,9 @@ if __name__ == "__main__":
                 arr = np.array(ohlcv, dtype=float)
                 zone = detect_impulse_and_zone(arr, cfg)
                 if not zone: continue
-                sig = check_bos_sfp(arr, zone, cfg); if not sig: continue
+                sig = check_bos_sfp(arr, zone, cfg)
+                if not sig:
+                   continue
 
                 # Hard regime filter
                 regime = regime_tag_from_vol(arr, cfg)
